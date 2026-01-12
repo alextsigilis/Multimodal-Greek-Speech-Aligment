@@ -82,6 +82,7 @@ class MlpAligner(nn.Module):
                  speech_dim = 384,
                  text_dim = 384,
                  hidden_dims = (500,),
+                 dropout = 0.1,
                  **kwargs):
 
         super().__init__()
@@ -92,7 +93,7 @@ class MlpAligner(nn.Module):
         hidden_dims = [int(d) for d in hidden_dims]
 
         dim_pairs = pairwise([speech_dim, *hidden_dims, text_dim])
-        dropout = nn.Dropout(0.1) # NOTE: Hard code!
+        self.dropout = nn.Dropout(dropout) # NOTE: Hard code!
         self.layers = nn.ModuleList([
             nn.Linear(d1, d2)
             for d1, d2 in self.layers

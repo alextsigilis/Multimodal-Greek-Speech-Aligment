@@ -11,7 +11,7 @@ import argparse
 import torch
 import librosa
 import numpy as np
-from datasets import load_dataset, DatasetDict
+from datasets import load_dataset, DatasetDict, Features, Array2D, Sequence, Value
 from transformers import AutoModel, AutoFeatureExtractor
 from sentence_transformers import SentenceTransformer
 import torch.nn.functional as F
@@ -57,7 +57,7 @@ def embed_speech(preprocessor, model, speech, sr, device):
 
     speech_emb = enc_out.last_hidden_state.cpu()
     T_max = speech_emb.size(1)
-    attn_mask = attn_mask[:, :T_max].cpu()
+    attn_mask = attn_mask[:, :T_max].to(torch.int16).cpu()
 
     return speech_emb, attn_mask
 
@@ -99,7 +99,6 @@ def embed_transcripts(encoder, batch, batch_size):
         convert_to_tensor=True
     )
 
-
 def run(
     base: str = BASE,
     save_dir: str = SAVE_DIR,
@@ -129,6 +128,24 @@ def run(
     speech_model = AutoModel.from_pretrained(speech_encoder).to(device).eval()
     text_encoder = SentenceTransformer(text_encoder, device=device)
 
+    # Find out resulting shapes
+    test_batch = orig_ds['test'][0:1]
+    test_speech = resample(test_batch, target_sr)
+    test_sp_emb, test_attn_mask = embed_speech(speech_preprocessor,
+                                               speech_model,
+                                               test_speech,
+                                               target_sr,
+                                               device)
+    pooled_test_sp_emb, pooled_test_mask = masked_mean_pool_time(test_sp_emb,
+                                                                 test_attn_mask,
+                                                                 kernel_size=kernel_size,
+                                                                 stride=stride)
+    test_txt_emb = embed_transcripts(text_encoder,
+                                     test_batch,
+                                     batch_size=1)
+    _, time_dim, speech_dim = pooled_test_sp_emb.size()
+    _, text_dim = test_txt_emb.size()
+
     def precompute(batch):
         speech = resample(batch, target_sr)
 
@@ -155,17 +172,26 @@ def run(
 
         # ↓↓↓ FINAL STORAGE DTYPES ↓↓↓
         return {
-            'pooled_speech_embeddings': pooled_emb.to(torch.float16),
-            'pooled_attn_masks': new_mask.to(torch.int16),
-            'transcript_embeddings': transcript_emb.to(torch.float16)
+            'pooled_speech_embeddings': pooled_emb.tolist(),
+            'pooled_attn_masks': new_mask.tolist(),
+            'transcript_embeddings': transcript_emb.tolist(),
         }
+
+    features = Features({
+        'pooled_speech_embeddings': Array2D(shape=(time_dim, speech_dim),
+                                            dtype='float16'),
+        'pooled_attn_masks': Sequence(Value('int16')),
+        'transcript_embeddings': Sequence(Value('float16'))
+    })
 
     tmp = orig_ds.map(
         precompute,
         batched=True,
         batch_size=batch_size,
         num_proc=None,
-        desc="Precomputing pooled speech + text embeddings (fp16 + int16)"
+        features=features,
+        remove_columns=orig_ds['train'].column_names,
+        desc="Precomputing pooled speech + text embeddings"
     )
 
     clean = DatasetDict({

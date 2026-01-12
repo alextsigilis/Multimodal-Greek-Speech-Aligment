@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 
 from datasets import load_from_disk
 
-from model import SpeechEncoder
+from models import SpeechEncoder
 from loss import ContrastiveLoss
 
 
@@ -175,7 +175,9 @@ def run(data_dir,
         no_cuda: int = False,
         output_dir: str = 'outputs',):
 
-    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, checkpoint_name)
+    print('making dir:', output_path)
+    os.makedirs(output_path, exist_ok=True)
     set_seed(seed)
 
     device = torch.device(
@@ -240,12 +242,7 @@ def run(data_dir,
     with open(config_file) as f:
         config = json.load(f, parse_int=int, parse_float=float)
 
-    aligner = Aligner(**config)
-
-    model = SpeechAdapter(
-        aligner=aligner,
-        text_encoder_id=text_encoder_id,
-    ).to(device)
+    model = SpeechEncoder(**config).to(device)
 
     criterion = ContrastiveLoss(
         init_tau=init_tau,
@@ -295,38 +292,35 @@ def run(data_dir,
     plt.legend()
     plt.grid(True)
 
-    plot_path = os.path.join(output_dir, "loss_curve.png")
+    plot_path = os.path.join(output_path, "loss_curve.png")
     plt.savefig(plot_path, bbox_inches="tight")
     print(f"Saved loss curve to: {plot_path}")
 
     # ----------------------------
     # Save checkpoint
     # ----------------------------
-    checkpoint_path = os.path.join(output_dir, checkpoint_name)
+    os.makedirs(output_path, exist_ok=True)
     checkpoint = {
         "model_state_dict": model.state_dict(),
         "criterion_state_dict": criterion.state_dict(),
     }
-    torch.save(checkpoint, checkpoint_path)
+    torch.save(checkpoint, os.path.join(output_path, 'checkpoint'))
 
-    print(f"Saved checkpoint to: {checkpoint_path}")
+    print(f"Saved checkpoint to: {output_path}")
 
     # ----------------------------
     # Save arguments
     # ----------------------------
-    args_path = os.path.join(output_dir, 'args.json')
+    args_path = os.path.join(output_path, 'args.json')
     with open(args_path, 'w') as f:
         json.dump({
             'data_dir': data_dir,
             'checkpoint_name': checkpoint_name,
+            'config': config,
             'val_ratio': val_ratio,
             'batch_size': batch_size,
             'num_workers': num_workers,
             'speech_dim': speech_dim,
-            'aligner_type': aligner_type,
-            'hidden_dims': hidden_dims,
-            'conv_sizes': conv_sizes,
-            'pool_sizes': pool_sizes,
             'text_encoder_id': text_encoder_id,
             'init_tau': init_tau,
             'normalize_inputs': normalize_inputs,
@@ -336,7 +330,7 @@ def run(data_dir,
             'seed': seed,
             'no_cuda': no_cuda,
             'output_dir': output_dir,
-        }, f)
+        }, f, indent=1)
 
 if __name__ == "__main__":
     #
