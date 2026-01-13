@@ -67,7 +67,7 @@ class LinearAligner(nn.Module):
         self.text_dim = text_dim
 
     def forward(self, speech_embs, attn_mask):
-        return self.linear_layer(speech_embs)
+        return self.linear_layer(speech_embs), attn_mask
 
 class MlpAligner(nn.Module):
     '''
@@ -104,7 +104,113 @@ class MlpAligner(nn.Module):
         for layer in self.layers:
             h = layer(h)
             h = nn.GELU(h)
-        return h
+        return h, attn_mask
+
+
+class CnnAligner(nn.Module):
+    '''
+    CNN Aligner with multi-kernel convolutions and temporal downsampling.
+
+    input:  speech_embs [B, T, speech_dim]
+    output: aligned_embs [B, T', text_dim]
+            pooled_mask  [B, T']
+    '''
+
+    def __init__(self,
+                 speech_dim: int = 384,
+                 text_dim: int = 384,
+                 hidden_dim: int = 256,
+                 kernel_sizes=(3, 5, 7),
+                 num_layers: int = 2,
+                 pool_stride: int = 2,
+                 dropout: float = 0.1,
+                 **kwargs):
+
+        super().__init__()
+
+        speech_dim = int(speech_dim)
+        text_dim = int(text_dim)
+        hidden_dim = int(hidden_dim)
+        kernel_sizes = [int(k) for k in kernel_sizes]
+
+        self.kernel_sizes = kernel_sizes
+        self.pool_stride = pool_stride
+
+        self.convs = nn.ModuleList()
+        self.norms = nn.ModuleList()
+
+        in_channels = speech_dim
+
+        for _ in range(num_layers):
+            layer_convs = nn.ModuleList([
+                nn.Conv1d(
+                    in_channels=in_channels,
+                    out_channels=hidden_dim,
+                    kernel_size=k,
+                    padding=k // 2
+                )
+                for k in kernel_sizes
+            ])
+            self.convs.append(layer_convs)
+            self.norms.append(nn.LayerNorm(hidden_dim * len(kernel_sizes)))
+            in_channels = hidden_dim * len(kernel_sizes)
+
+        self.pool = nn.MaxPool1d(
+            kernel_size=pool_stride,
+            stride=pool_stride
+        )
+
+        self.proj = nn.Conv1d(in_channels, text_dim, kernel_size=1)
+        self.dropout = nn.Dropout(dropout)
+        self.act = nn.GELU()
+
+        self.speech_dim = speech_dim
+        self.text_dim = text_dim
+
+    def forward(self, speech_embs, attn_mask):
+        """
+        speech_embs: [B, T, speech_dim]
+        attn_mask:   [B, T]
+        """
+
+        # [B, C, T]
+        x = speech_embs.transpose(1, 2)
+        mask = attn_mask
+
+        for convs, norm in zip(self.convs, self.norms):
+            # Multi-kernel conv
+            feats = [self.act(conv(x)) for conv in convs]
+            x = torch.cat(feats, dim=1)   # [B, C', T]
+            x = self.dropout(x)
+
+            # Pool in time
+            x = self.pool(x)
+            mask = self._pool_mask(mask)
+
+            # LayerNorm over channels
+            x = x.transpose(1, 2)          # [B, T', C']
+            x = norm(x)
+            x = x.transpose(1, 2)          # [B, C', T']
+
+        x = self.proj(x)                  # [B, text_dim, T']
+        x = x.transpose(1, 2)             # [B, T', text_dim]
+
+        return x, mask
+
+    def _pool_mask(self, mask):
+        """
+        Downsample attention mask consistently with temporal pooling.
+        """
+        if mask is None:
+            return None
+
+        mask = mask.unsqueeze(1).float()  # [B, 1, T]
+        mask = F.max_pool1d(
+            mask,
+            kernel_size=self.pool_stride,
+            stride=self.pool_stride,
+        )
+        return mask.squeeze(1).long()
 
 
 class SpeechEncoder(nn.Module):
@@ -112,6 +218,7 @@ class SpeechEncoder(nn.Module):
     name2model = {
         'linear': LinearAligner,
         'mlp' : MlpAligner,
+        'cnn' : CnnAligner
     }
 
     def __init__(self,
@@ -124,5 +231,5 @@ class SpeechEncoder(nn.Module):
         self.aligner = Aligner(**kwargs)
 
     def forward(self, speech_embs, attn_mask):
-        aligned_speech_embs = self.aligner(speech_embs, attn_mask)
+        aligned_speech_embs, attn_mask = self.aligner(speech_embs, attn_mask)
         return mean_pooling(aligned_speech_embs, attn_mask)

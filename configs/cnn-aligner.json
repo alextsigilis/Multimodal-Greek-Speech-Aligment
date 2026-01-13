@@ -1,0 +1,11 @@
+{
+  "aligner_type": "cnn",
+  "speech_dim": 384,
+  "text_dim": 384,
+  "hidden_dim": 256,
+  "kernel_sizes": [3, 5, 7, 13],
+  "num_layer": 2,
+  "pool_stride": 2,
+  "dropout": 0.25
+}
+
