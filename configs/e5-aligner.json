@@ -1,0 +1,7 @@
+{
+  "aligner_type": "e5",
+  "speech_dim": 384,
+  "text_dim": 384,
+  "text_encoder_id": "intfloat/multilingual-e5-small",
+  "fine_tune_layers": 2
+}

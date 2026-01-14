@@ -165,7 +165,6 @@ def run(data_dir,
         batch_size: int = 128,
         num_workers: int = 4,
         speech_dim: int = 384,
-        text_encoder_id: str = "intfloat/multilingual-e5-small",
         init_tau: float = 0.07,
         normalize_inputs: bool = True,
         epochs: int = 10,
@@ -321,7 +320,6 @@ def run(data_dir,
             'batch_size': batch_size,
             'num_workers': num_workers,
             'speech_dim': speech_dim,
-            'text_encoder_id': text_encoder_id,
             'init_tau': init_tau,
             'normalize_inputs': normalize_inputs,
             'epochs': epochs,
@@ -349,8 +347,6 @@ if __name__ == "__main__":
     # Model / loss hyperparameters
     parser.add_argument("--speech-dim", type=int, default=384,
                         help="Dimensionality of pooled speech embeddings (in_dim of aligner)")
-    parser.add_argument("--text-encoder-id", type=str, default="intfloat/multilingual-e5-small",
-                        help="HuggingFace ID of frozen text encoder")
     parser.add_argument("--init-tau", type=float, default=0.07,
                         help="Initial temperature for contrastive loss")
     parser.add_argument("--normalize-inputs", action="store_true",

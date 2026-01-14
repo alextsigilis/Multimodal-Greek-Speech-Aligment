@@ -1,0 +1,10 @@
+{
+  "aligner_type": "lstm",
+  "speech_dim": 384,
+  "text_dim": 384,
+  "hidden_dim": 256,
+  "num_layers": 4,
+  "bidirectional": true,
+  "pool_stride": 2,
+  "dropout": 0.1
+}
