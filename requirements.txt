@@ -1,3 +1,5 @@
+absl-py==2.4.0
+accelerate==1.12.0
 aiohappyeyeballs==2.6.1
 aiohttp==3.13.3
 aiosignal==1.4.0
@@ -17,9 +19,11 @@ decorator==5.2.1
 dill==0.4.0
 executing==2.2.1
 filelock==3.20.2
+flatbuffers==25.12.19
 fonttools==4.61.1
 frozenlist==1.8.0
 fsspec==2025.10.0
+grpcio==1.78.0
 h11==0.16.0
 hf-xet==1.2.0
 httpcore==1.0.9
@@ -37,10 +41,14 @@ jupyter_core==5.9.1
 kiwisolver==1.4.9
 lazy_loader==0.4
 librosa==0.11.0
+lightning==2.6.1
+lightning-utilities==0.15.2
 llvmlite==0.46.0
+Markdown==3.10.2
 MarkupSafe==3.0.3
 matplotlib==3.10.8
 matplotlib-inline==0.2.1
+ml_dtypes==0.5.4
 mpmath==1.3.0
 msgpack==1.1.2
 multidict==6.7.0
@@ -64,6 +72,10 @@ nvidia-nccl-cu12==2.27.5
 nvidia-nvjitlink-cu12==12.8.93
 nvidia-nvshmem-cu12==3.3.20
 nvidia-nvtx-cu12==12.8.90
+onnx==1.20.1
+onnxruntime==1.24.1
+optimum==2.1.0
+optimum-onnx==0.1.0
 packaging==25.0
 pandas==2.3.3
 parso==0.8.5
@@ -73,6 +85,7 @@ platformdirs==4.5.1
 pooch==1.8.2
 prompt_toolkit==3.0.52
 propcache==0.4.1
+protobuf==6.33.5
 psutil==7.2.1
 ptyprocess==0.7.0
 pure_eval==0.2.3
@@ -81,6 +94,7 @@ pycparser==2.23
 Pygments==2.19.2
 pyparsing==3.3.1
 python-dateutil==2.9.0.post0
+pytorch-lightning==2.6.1
 pytz==2025.2
 PyYAML==6.0.3
 pyzmq==27.1.0
@@ -96,9 +110,12 @@ soundfile==0.13.1
 soxr==1.0.0
 stack-data==0.6.3
 sympy==1.14.0
+tensorboard==2.20.0
+tensorboard-data-server==0.7.2
 threadpoolctl==3.6.0
 tokenizers==0.22.2
 torch==2.9.1
+torchmetrics==1.8.2
 tornado==6.5.4
 tqdm==4.67.1
 traitlets==5.14.3
@@ -108,5 +125,6 @@ typing_extensions==4.15.0
 tzdata==2025.3
 urllib3==2.6.2
 wcwidth==0.2.14
+Werkzeug==3.1.5
 xxhash==3.6.0
 yarl==1.22.0

@@ -1,8 +1,0 @@
-{
-  "aligner_type": "linear",
-  "speech_dim": 384,
-  "text_dim": 384,
-  "hidden_dims": [1024, 512],
-  "dropout": 0.2
-}
-

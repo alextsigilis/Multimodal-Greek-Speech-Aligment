@@ -42,9 +42,9 @@ def mean_pooling(hidden_state, mask):
     pooled = sum_hidden / lengths
     return pooled
 
-class LinearAligner(nn.Module):
+class LinearAdapter(nn.Module):
     '''
-    Linear Aligner.
+    Linear Adapter.
     It's purpose is to transform a sequence of speech embedding vectors to pseudo-tokens
     for the text encoder.
 
@@ -69,47 +69,9 @@ class LinearAligner(nn.Module):
     def forward(self, speech_embs, attn_mask):
         return self.linear_layer(speech_embs), attn_mask
 
-class MlpAligner(nn.Module):
+class CnnAdapter(nn.Module):
     '''
-    MLP Aligner.
-    It's purpose is to transform a sequence of speech embedding vectors to pseudo-tokens
-    for the text encoder.
-
-    input: Tensor [B, L, speech_dim]
-    out: Tensor [B, L, text_dim]
-    '''
-    def __init__(self,
-                 speech_dim = 384,
-                 text_dim = 384,
-                 hidden_dims = (500,),
-                 dropout = 0.1,
-                 **kwargs):
-
-        super().__init__()
-
-        # Make sure dims are int
-        speech_dim = int(speech_dim)
-        tex_dim = int(text_dim)
-        hidden_dims = [int(d) for d in hidden_dims]
-
-        dim_pairs = pairwise([speech_dim, *hidden_dims, text_dim])
-        self.dropout = nn.Dropout(dropout) # NOTE: Hard code!
-        self.layers = nn.ModuleList([
-            nn.Linear(d1, d2)
-            for d1, d2 in self.layers
-        ])
-
-    def forward(self, speech_embs, attn_mask):
-        h = speech_embs
-        for layer in self.layers:
-            h = layer(h)
-            h = nn.GELU(h)
-        return h, attn_mask
-
-
-class CnnAligner(nn.Module):
-    '''
-    CNN Aligner with multi-kernel convolutions and temporal downsampling.
+    CNN Adapter with multi-kernel convolutions and temporal downsampling.
 
     input:  speech_embs [B, T, speech_dim]
     output: aligned_embs [B, T', text_dim]
@@ -135,7 +97,6 @@ class CnnAligner(nn.Module):
 
         self.kernel_sizes = kernel_sizes
         self.pool_stride = pool_stride
-
         self.convs = nn.ModuleList()
         self.norms = nn.ModuleList()
 
@@ -212,183 +173,70 @@ class CnnAligner(nn.Module):
         )
         return mask.squeeze(1).long()
 
-class LstmAligner(nn.Module):
-    '''
-    LSTM Aligner with optional temporal downsampling.
-
-    input:  speech_embs [B, T, speech_dim]
-            attn_mask   [B, T]
-    output: aligned_embs [B, T', text_dim]
-            pooled_mask  [B, T']
-    '''
-
-    def __init__(self,
-                 speech_dim: int = 384,
-                 text_dim: int = 384,
-                 hidden_dim: int = 256,
-                 num_layers: int = 2,
-                 bidirectional: bool = True,
-                 pool_stride: int = 1,
-                 dropout: float = 0.1,
-                 **kwargs):
-
-        super().__init__()
-
-        speech_dim = int(speech_dim)
-        text_dim = int(text_dim)
-        hidden_dim = int(hidden_dim)
-
-        self.pool_stride = int(pool_stride)
-        self.bidirectional = bidirectional
-
-        self.lstm = nn.LSTM(
-            input_size=speech_dim,
-            hidden_size=hidden_dim,
-            num_layers=num_layers,
-            batch_first=True,
-            bidirectional=bidirectional,
-            dropout=dropout if num_layers > 1 else 0.0,
-        )
-
-        lstm_out_dim = hidden_dim * (2 if bidirectional else 1)
-
-        self.proj = nn.Linear(lstm_out_dim, text_dim)
-
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, speech_embs, attn_mask):
-        """
-        speech_embs: [B, T, speech_dim]
-        attn_mask:   [B, T]
-        """
-
-        # Compute true lengths from mask
-        lengths = attn_mask.sum(dim=1).cpu()
-
-        # Pack padded sequence
-        packed = nn.utils.rnn.pack_padded_sequence(
-            speech_embs,
-            lengths,
-            batch_first=True,
-            enforce_sorted=False,
-        )
-
-        packed_out, _ = self.lstm(packed)
-
-        # Unpack
-        T = attn_mask.size(1)
-        
-        x, _ = nn.utils.rnn.pad_packed_sequence(
-            packed_out,
-            batch_first=True,
-            total_length=T,
-        )
-        
-        x = self.dropout(x)
-        x = self.proj(x)  # [B, T, text_dim]
-
-        # Optional temporal downsampling
-        if self.pool_stride > 1:
-            x = x[:, ::self.pool_stride, :]
-            attn_mask = attn_mask[:, ::self.pool_stride]
-
-        return x, attn_mask
-
-
-class E5Aligner(nn.Module):
+class AlignmentModel(nn.Module):
     """
-    E5-based Aligner.
+    Alignment model operating on precomputed embeddings.
 
-    Transforms speech embeddings into pseudo-token embeddings using a linear
-    projection, then feeds them into a pretrained multilingual-e5-small
-    transformer encoder.
+    Takes precomputed Whisper encoder hidden states and E5 text embeddings.
+    Only the adapter and learnable temperature are trainable.
 
-    input:
-        speech_embs : [B, T, speech_dim]
-        attn_mask   : [B, T]
-
-    output:
-        aligned_embs : [B, T, text_dim]
-        attn_mask    : [B, T]
+    Parameters
+    ----------
+    adapter : nn.Module
+        A speech adapter module (e.g. ``CnnAdapter``, ``LstmAdapter``) that
+        maps ``[B, T, speech_dim]`` → ``[B, T', text_dim]``.
+    init_tau : float
+        Initial temperature for contrastive loss (default: 0.07).
     """
 
-    def __init__(
-        self,
-        speech_dim: int = 384,
-        text_dim: int = 384,
-        text_encoder_id: str = "intfloat/multilingual-e5-small",
-        fine_tune_layers: int = 2,
-        **kwargs,
-    ):
+    def __init__(self,
+                 adapter: nn.Module,
+                 init_tau: float = 0.07,
+                 gamma: float = 0.1,
+                 **kwargs):
         super().__init__()
 
-        self.speech_dim = int(speech_dim)
-        self.text_dim = int(text_dim)
-
-        # Linear projection: speech → E5 token space
-        self.proj = nn.Linear(self.speech_dim, self.text_dim)
-
-        # Load E5 encoder
-        self.text_encoder = AutoModel.from_pretrained(text_encoder_id)
-
-        # -------------------------------------------------
-        # Freeze everything
-        # -------------------------------------------------
-        for param in self.text_encoder.parameters():
-            param.requires_grad = False
-
-        # -------------------------------------------------
-        # Unfreeze first N transformer layers
-        # -------------------------------------------------
-        encoder_layers = self.text_encoder.encoder.layer
-        for layer in encoder_layers[:fine_tune_layers]:
-            for param in layer.parameters():
-                param.requires_grad = True
-
-    def forward(self, speech_embs, attn_mask):
-        """
-        speech_embs: [B, T, speech_dim]
-        attn_mask:   [B, T]
-        """
-
-        # Project speech frames to pseudo-token embeddings
-        token_embs = self.proj(speech_embs)  # [B, T, text_dim]
-
-        # Feed directly as inputs_embeds
-        outputs = self.text_encoder(
-            inputs_embeds=token_embs,
-            attention_mask=attn_mask,
-            return_dict=True,
+        self.adapter = adapter
+        self.gamma = gamma
+        self.log_tau = nn.Parameter(
+            torch.log(torch.tensor(init_tau, dtype=torch.float32))
         )
 
-        # Contextualized pseudo-tokens
-        hidden_states = outputs.last_hidden_state  # [B, T, text_dim]
+    def forward(self, speech_hidden, speech_mask, text_emb):
+        """
+        Parameters
+        ----------
+        speech_hidden : Tensor [B, T, speech_dim]
+            Precomputed Whisper encoder hidden states.
+        speech_mask : Tensor [B, T]
+            Attention mask (1 = real frame, 0 = padding).
+        text_emb : Tensor [B, text_dim]
+            Precomputed E5 text embeddings.
 
-        return hidden_states, attn_mask
+        Returns
+        -------
+        dict with keys: loss, logits, speech_emb, text_emb
+        """
+        aligned_speech, aligned_mask = self.adapter(speech_hidden, speech_mask)
+        speech_emb = mean_pooling(aligned_speech, aligned_mask)  # [B, D]
 
-# 
-# The Final Speech Encoder
-# 
+        speech_emb = F.normalize(speech_emb, dim=-1)
+        text_emb = F.normalize(text_emb, dim=-1)
 
-class SpeechEncoder(nn.Module):
+        tau = torch.exp(self.log_tau)
+        logits = (speech_emb @ text_emb.T) / tau  # [B, B]
 
-    name2model = {
-        'linear': LinearAligner,
-        'mlp' : MlpAligner,
-        'cnn' : CnnAligner,
-        'lstm': LstmAligner,
-        'e5'  : E5Aligner
-    }
+        labels = torch.arange(logits.size(0), device=logits.device)
+        loss = self.gamma * F.cross_entropy(logits, labels) + (1-self.gamma) * F.cross_entropy(logits.T, labels)
 
-    def __init__(self,
-                 aligner_type: str = LinearAligner,
-                 **kwargs):
-
-        super().__init__()
-
-        Aligner = self.name2model[aligner_type]
-        self.aligner = Aligner(**kwargs)
-
-    def forward(self, speech_embs, attn_mask):
-        aligned_speech_embs, attn_mask = self.aligner(speech_embs, attn_mask)
-        return mean_pooling(aligned_speech_embs, attn_mask)
+        return {
+            'loss': loss,
+            'logits': logits,
+            'speech_emb': speech_emb,
+            'text_emb': text_emb,
+        }
+    
+    def encode(self, speech_hidden, speech_mask):
+        aligned_speech, aligned_mask = self.adapter(speech_hidden, speech_mask)
+        speech_emb = mean_pooling(aligned_speech, aligned_mask)  # [B, D]
+        return F.normalize(speech_emb, dim=-1)

@@ -6,7 +6,7 @@
 # Author: Alexandros Tsingilis
 # Date: 28 Nov 2025
 #
-import os, re
+import os, re, string, unicodedata
 import argparse
 import torch
 import librosa
@@ -26,6 +26,22 @@ TARGET_SR = 16_000  # 16kHz
 
 
 def resample(batch, target_sr):
+    """Resample a batch of audio waveforms to the target sampling rate.
+
+    Parameters
+    ----------
+    batch : dict
+        A batch from the HuggingFace dataset containing an ``'audio'`` key,
+        where each element has ``'array'`` (waveform) and
+        ``'sampling_rate'`` fields.
+    target_sr : int
+        Target sampling rate in Hz (e.g. 16000).
+
+    Returns
+    -------
+    list[np.ndarray]
+        List of resampled waveforms.
+    """
     audios = batch['audio']
     waveforms = [np.array(audio['array']) for audio in audios]
     sampling_rates = [audio['sampling_rate'] for audio in audios]
@@ -37,6 +53,29 @@ def resample(batch, target_sr):
 
 
 def embed_speech(preprocessor, model, speech, sr, device):
+    """Encode raw speech waveforms into Whisper encoder hidden states.
+
+    Parameters
+    ----------
+    preprocessor : AutoFeatureExtractor
+        Whisper feature extractor that converts waveforms to log-mel
+        spectrograms.
+    model : AutoModel
+        Whisper model (only the encoder is used).
+    speech : list[np.ndarray]
+        List of resampled waveforms.
+    sr : int
+        Sampling rate of the waveforms.
+    device : str
+        Device to run inference on (``'cuda'`` or ``'cpu'``).
+
+    Returns
+    -------
+    speech_emb : torch.Tensor
+        Encoder hidden states of shape ``[B, T, D]`` (CPU, float32).
+    attn_mask : torch.Tensor
+        Attention mask of shape ``[B, T]`` (CPU, int16).
+    """
     inputs = preprocessor(
         speech,
         sampling_rate=sr,
@@ -69,6 +108,31 @@ def masked_mean_pool_time(
     stride=4,
     eps=1e-5
 ):
+    """Temporally downsample speech embeddings via masked average pooling.
+
+    Applies 1-D average pooling along the time axis while respecting the
+    attention mask so that padding frames do not contribute.
+
+    Parameters
+    ----------
+    speech_emb : torch.Tensor
+        Speech hidden states of shape ``[B, T, D]``.
+    attn_mask : torch.Tensor
+        Binary attention mask of shape ``[B, T]``.
+    kernel_size : int, optional
+        Pooling window size (default: 8).
+    stride : int, optional
+        Pooling stride (default: 4).
+    eps : float, optional
+        Small constant to avoid division by zero (default: 1e-5).
+
+    Returns
+    -------
+    pooled_emb : torch.Tensor
+        Downsampled embeddings of shape ``[B, T', D]``.
+    new_mask : torch.Tensor
+        Binary mask of shape ``[B, T']`` indicating valid pooled frames.
+    """
     B, T, D = speech_emb.shape
     x = speech_emb.permute(0, 2, 1)
     valid = attn_mask.unsqueeze(1).to(x.dtype)
@@ -85,11 +149,38 @@ def masked_mean_pool_time(
     return pooled_emb.permute(0, 2, 1), new_mask
 
 
-def embed_transcripts(encoder, batch, batch_size):
-    sentences = [
-        re.sub(r'\[.+\]', '', s).strip()
-        for s in batch['sentence']
-    ]
+def clean_text(text):
+    """Clean text: remove bracket tokens, punctuation, normalize unicode, lowercase."""
+    text = re.sub(r'\[[^\]]+\]', '', text)  # remove [UNK] etc. (non-greedy)
+    text = text.translate(str.maketrans('', '', string.punctuation))
+    text = unicodedata.normalize('NFKD', text)
+    text = text.lower()
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
+def embed_transcripts(encoder, batch, batch_size=BATCH_SIZE):
+    """Encode transcript sentences into normalised E5 embeddings.
+
+    Each sentence is cleaned via :func:`clean_text`, prepended with the
+    ``'query: '`` prefix required by E5, and encoded with the
+    SentenceTransformer model.
+
+    Parameters
+    ----------
+    encoder : SentenceTransformer
+        The multilingual-e5-small sentence transformer.
+    batch : dict
+        A batch dict containing a ``'sentence'`` key with raw transcripts.
+    batch_size : int
+        Encoding batch size passed to ``encoder.encode``.
+
+    Returns
+    -------
+    torch.Tensor
+        L2-normalised transcript embeddings of shape ``[B, D]``.
+    """
+    sentences = [clean_text(s) for s in batch['sentence']]
     queries = [f'query: {s}' for s in sentences]
 
     return encoder.encode(
@@ -109,6 +200,38 @@ def run(
     stride: int = 4,
     batch_size: int = BATCH_SIZE
 ):
+    """Run the full preprocessing pipeline.
+
+    Loads the raw ``ddamianos/hparl`` dataset, computes pooled Whisper
+    encoder embeddings for speech and normalised E5 embeddings for
+    transcripts, then saves the result as an Arrow dataset.
+
+    Parameters
+    ----------
+    base : str
+        Root directory for HuggingFace caches and output.
+    save_dir : str
+        Sub-directory under *base* where the precomputed dataset is saved.
+    speech_encoder : str
+        HuggingFace model ID for the speech encoder (default: whisper-tiny).
+    text_encoder : str
+        HuggingFace model ID for the text encoder (default:
+        multilingual-e5-small).
+    target_sr : int
+        Target sampling rate for audio resampling (default: 16000).
+    kernel_size : int
+        Temporal pooling window size (default: 8).
+    stride : int
+        Temporal pooling stride (default: 4).
+    batch_size : int
+        Batch size for dataset ``.map()`` and encoder inference.
+
+    Returns
+    -------
+    DatasetDict
+        The precomputed dataset with columns ``pooled_speech_embeddings``,
+        ``pooled_attn_masks``, and ``transcript_embeddings``.
+    """
     # HuggingFace caches
     os.environ["HF_DATASETS_CACHE"] = f"{base}/datasets"
     os.environ["HF_HOME"] = base
@@ -126,7 +249,7 @@ def run(
 
     speech_preprocessor = AutoFeatureExtractor.from_pretrained(speech_encoder)
     speech_model = AutoModel.from_pretrained(speech_encoder).to(device).eval()
-    text_encoder = SentenceTransformer(text_encoder, device=device)
+    te_model = SentenceTransformer(text_encoder, device=device)
 
     # Find out resulting shapes
     test_batch = orig_ds['test'][0:1]
@@ -140,7 +263,7 @@ def run(
                                                                  test_attn_mask,
                                                                  kernel_size=kernel_size,
                                                                  stride=stride)
-    test_txt_emb = embed_transcripts(text_encoder,
+    test_txt_emb = embed_transcripts(te_model,
                                      test_batch,
                                      batch_size=1)
     _, time_dim, speech_dim = pooled_test_sp_emb.size()
@@ -165,7 +288,7 @@ def run(
         )
 
         transcript_emb = embed_transcripts(
-            text_encoder,
+            te_model,
             batch,
             batch_size=batch_size
         )
