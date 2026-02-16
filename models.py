@@ -1,3 +1,4 @@
+#
 #   model.py
 #
 # Definition of the model for Speech - Transcript aligment.
@@ -9,6 +10,31 @@ import torch
 import torch.nn as nn, torch.nn.functional as F
 from itertools import pairwise
 from transformers import AutoModel
+
+def get_adapter_class(adapter_type):
+    """
+    Returns the adapter class corresponding to the adapter_type string.
+    Supported types: 'cnn', 'linear', 'mlp'.
+    Extend this function to add new adapters.
+
+    Args:
+        adapter_type (str): The type of adapter (case-insensitive).
+
+    Returns:
+        nn.Module class: The adapter class.
+
+    Raises:
+        ValueError: If adapter_type is unknown.
+    """
+    adapter_type = str(adapter_type).strip().lower()
+    match adapter_type:
+        case "cnn":
+            return CnnAdapter
+        case "linear":
+            return LinearAdapter
+        case _:
+            raise ValueError(f"Unknown adapter_type: {adapter_type}")
+
 
 def mean_pooling(hidden_state, mask):
     '''

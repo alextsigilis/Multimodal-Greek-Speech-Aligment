@@ -10,6 +10,7 @@ from datasets import load_from_disk
 from torch.utils.data import DataLoader
 
 from models import mean_pooling, CnnAdapter, AlignmentModel
+from models import get_adapter_class
 from preprocess import run as precompute
 
 
@@ -117,16 +118,11 @@ def plot_recall_curve(recall_dict, mrr, output_path):
 # Load model & config from checkpoint directory
 # ---------------------------------------------------------
 def load_model_from_checkpoint(ckpt_path, config):
-    # Load the correct model as in train.ipynb
-    adapter = CnnAdapter(
-        speech_dim=config.get("speech_dim", 384),
-        text_dim=config.get("text_dim", 384),
-        hidden_dim=config.get("hidden_dim", 256),
-        kernel_sizes=tuple(config.get("kernel_sizes", [3,5,7])),
-        num_layers=config.get("num_layers", 2),
-        pool_stride=config.get("pool_stride", 2),
-        dropout=config.get("dropout", 0.1),
-    )
+    # Select adapter type based on config
+    adapter_type = config.get("adapter_type", "cnn")
+    adapter_kwargs = config.get("kwargs", {})
+    AdapterClass = get_adapter_class(adapter_type)
+    adapter = AdapterClass(**adapter_kwargs)
     model = AlignmentModel(adapter=adapter, init_tau=config.get("init_tau", 0.07))
     checkpoint = torch.load(ckpt_path, map_location="cpu")
     # Handle LightningModule checkpoints with 'model.' prefix
@@ -135,20 +131,53 @@ def load_model_from_checkpoint(ckpt_path, config):
     if any(k.startswith("model.") for k in state_dict.keys()):
         new_state_dict = {k.replace("model.", "", 1): v for k, v in state_dict.items()}
         state_dict = new_state_dict
-    model.load_state_dict(state_dict)
+    # Try strict loading first; if shapes mismatch, fall back to selective loading
+    try:
+        model.load_state_dict(state_dict)
+    except RuntimeError as e:
+        print(f"[WARN] Strict load failed: {e}")
+        model_state = model.state_dict()
+        compatible_state = {}
+        skipped = []
+        for k, v in state_dict.items():
+            if k in model_state:
+                if v.shape == model_state[k].shape:
+                    compatible_state[k] = v
+                else:
+                    skipped.append((k, v.shape, model_state[k].shape))
+            else:
+                # unexpected key in checkpoint
+                skipped.append((k, v.shape, None))
+        if compatible_state:
+            model.load_state_dict(compatible_state, strict=False)
+            print(f"[OK] Loaded {len(compatible_state)} compatible parameters; skipped {len(skipped)} mismatched/unexpected keys.")
+            for key, ck_shape, md_shape in skipped[:10]:
+                print(f"  - Skipped {key}: ckpt={ck_shape} model={md_shape}")
+            if len(skipped) > 10:
+                print(f"  ... and {len(skipped)-10} more skipped keys")
+        else:
+            raise RuntimeError("No compatible parameters found to load from checkpoint.")
     model.eval()
     return model
 # ---------------------------------------------------------
 # Main evaluation
 # ---------------------------------------------------------
 
-def main(ckpt_path, config_path, data_dir, k_values, batch_size=128, num_workers=4):
-    # Load config
+def main(ckpt_dir, ckpt_name, data_dir, k_values, batch_size=128, num_workers=4):
+    # Paths: config.json is expected to live in the same directory as the checkpoint
+    config_path = os.path.join(ckpt_dir, "config.json")
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Config file not found at {config_path}")
     with open(config_path) as f:
         config = json.load(f)
+    # Full checkpoint path
+    ckpt_path = os.path.join(ckpt_dir, ckpt_name)
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"Checkpoint not found at {ckpt_path}")
     # Load model
     model = load_model_from_checkpoint(ckpt_path, config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[INFO] Using device: {device}")
     model = model.to(device)
     # Load dataset
     print(f"[INFO] Loading dataset from {data_dir} ...")
@@ -178,8 +207,9 @@ def main(ckpt_path, config_path, data_dir, k_values, batch_size=128, num_workers
     # Evaluate MRR
     mrr_score = mrr_batched(gt_embs, pred_embs, batch_size=256, device=device)
     print(f"MRR: {mrr_score:.4f}")
-    # Output directory
-    output_dir = os.path.join(os.path.dirname(ckpt_path), "evaluation")
+    # Output directory with checkpoint name
+    checkpoint_name = os.path.splitext(os.path.basename(ckpt_path))[0]
+    output_dir = os.path.join(os.path.dirname(ckpt_path), f"evaluation_results_{checkpoint_name}")
     os.makedirs(output_dir, exist_ok=True)
     # Save results as CSV
     df = pd.DataFrame({"k": list(recall_scores.keys()), "recall": list(recall_scores.values())})
@@ -189,6 +219,7 @@ def main(ckpt_path, config_path, data_dir, k_values, batch_size=128, num_workers
     # Plot
     plot_recall_curve(recall_scores, mrr_score, os.path.join(output_dir, "recall_curve_text_to_speech.png"))
     print(f"[OK] Results saved to {output_dir}")
+    return recall_scores, mrr_score
 
 
 # ---------------------------------------------------------
@@ -197,16 +228,16 @@ def main(ckpt_path, config_path, data_dir, k_values, batch_size=128, num_workers
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Text→Speech Retrieval Evaluation")
-    parser.add_argument("--ckpt-path", type=str, required=True, help="Path to model checkpoint (e.g. cnn_alignment_model.ckpt)")
-    parser.add_argument("--config-path", type=str, required=True, help="Path to model config JSON (used in training)")
+    parser.add_argument("--ckpt-dir", type=str, required=True, help="Directory containing the checkpoint and config.json")
+    parser.add_argument("--ckpt-name", type=str, required=True, help="Checkpoint filename (e.g. cnn_alignment_model.ckpt)")
     parser.add_argument("--data-dir", type=str, required=True, help="Directory containing the preprocessed hparl dataset")
     parser.add_argument("--k", type=int, nargs="+", required=True, help="Values of K for Recall@K, e.g. --k 1 5 10 20 50")
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=4)
     args = parser.parse_args()
     main(
-        ckpt_path=args.ckpt_path,
-        config_path=args.config_path,
+        ckpt_dir=args.ckpt_dir,
+        ckpt_name=args.ckpt_name,
         data_dir=args.data_dir,
         k_values=args.k,
         batch_size=args.batch_size,
