@@ -4,6 +4,10 @@ Code for training and evaluating a contrastive aligner that maps Greek speech re
 to text embeddings (and vice-versa). The project uses precomputed Whisper encoder hidden
 states for speech and E5 embeddings for text.
 
+Dataset: this project uses the `ddamianos/hparl` dataset (Greek parliamentary transcripts).
+Both `train.py` and `evaluate.py` operate on the preprocessed `hparl` dataset produced by
+`preprocess.py` (default path shown below: `/mnt/h/hparl-preprocessed`).
+
 **Contents & key files**
 - `preprocess.py` — prepare dataset and precompute `pooled_speech_embeddings`, `pooled_attn_masks`, `transcript_embeddings` and save to disk.
 - `train.py` / `train.ipynb` — training script and notebook; uses `models.py` and Lightning to train adapters and saves checkpoints and `args.json`/`config.json` under the checkpoint directory.

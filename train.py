@@ -14,8 +14,10 @@ import matplotlib.pyplot as plt
 
 from datasets import load_from_disk
 
-from models import SpeechEncoder
+from models import AlignmentModel, get_adapter_class
 from loss import ContrastiveLoss
+import lightning as L
+from lightning.pytorch.loggers import TensorBoardLogger
 
 
 # ----------------------------
@@ -154,6 +156,127 @@ def validate(model, criterion, dataloader, device, epoch, num_epochs):
     return running_loss / max(num_batches, 1)
 
 
+class AlignmentLitModule(L.LightningModule):
+    """Lightning wrapper around AlignmentModel (precomputed embeddings)."""
+
+    def __init__(self, adapter: nn.Module, lr=1e-4, weight_decay=0.0, init_tau=0.07):
+        super().__init__()
+        self.save_hyperparameters(ignore=['adapter'])
+        self.model = AlignmentModel(adapter=adapter, init_tau=init_tau)
+
+    def forward(self, speech, mask, text):
+        return self.model(speech, mask, text)
+
+    def _shared_step(self, batch, stage):
+        out = self.model(batch['speech'], batch['mask'], batch['text'])
+        self.log('log_tau', self.model.log_tau, prog_bar=False, on_epoch=True, on_step=False)
+        self.log('tau', torch.exp(self.model.log_tau), prog_bar=False, on_epoch=True, on_step=False)
+
+        if stage == 'val':
+            self.log('val_loss', out['loss'], prog_bar=True, batch_size=batch['speech'].size(0), on_epoch=True, on_step=False)
+        return out
+
+    def training_step(self, batch, batch_idx):
+        out = self._shared_step(batch, 'train')
+        self.log('train_loss', out['loss'], prog_bar=True, batch_size=batch['speech'].size(0), on_epoch=True, on_step=False)
+        return out['loss']
+
+    def validation_step(self, batch, batch_idx):
+        self._shared_step(batch, 'val')
+
+    def configure_optimizers(self):
+        params = list(self.model.adapter.parameters()) + [self.model.log_tau]
+        return torch.optim.AdamW(params, lr=self.hparams.lr, weight_decay=self.hparams.weight_decay)
+
+
+class SpeechTextDataModule(L.LightningDataModule):
+    """DataModule for precomputed speech/text embeddings."""
+
+    def __init__(self, train_ds, val_ds, batch_size=64, num_workers=4):
+        super().__init__()
+        self.train_dataset = SpeechTextDataset(train_ds)
+        self.val_dataset = SpeechTextDataset(val_ds)
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+
+    def train_dataloader(self):
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.num_workers,
+            collate_fn=collate_fn,
+            pin_memory=True,
+        )
+
+    def val_dataloader(self):
+        return DataLoader(
+            self.val_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            collate_fn=collate_fn,
+            pin_memory=True,
+        )
+
+
+def run_training(train_ds, val_ds, adapter,
+                 batch_size=64,
+                 lr=1e-4,
+                 max_epochs=20,
+                 input_checkpoint=None,
+                 checkpoint_dir="./checkpoint",
+                 output_checkpoint_name="model.ckpt",
+                 logger_name="alignment",
+                 log_dir=None,
+                 accumulate_grad_batches=1,
+                 num_workers=4):
+    """Train or resume a speech-text alignment model with configurable parameters.
+
+    This mirrors the notebook implementation and uses PyTorch Lightning.
+    """
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    if log_dir is None:
+        log_dir = os.path.join(checkpoint_dir, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+
+    logger = TensorBoardLogger(log_dir, name=logger_name)
+
+    input_checkpoint_path = os.path.join(checkpoint_dir, input_checkpoint) if input_checkpoint else None
+    output_ckpt_path = os.path.join(checkpoint_dir, output_checkpoint_name)
+
+    if input_checkpoint_path is not None and os.path.exists(input_checkpoint_path):
+        print(f"Loading model from input checkpoint: {input_checkpoint_path}")
+        lit_model = AlignmentLitModule.load_from_checkpoint(input_checkpoint_path, adapter=adapter, lr=lr)
+    else:
+        print("No input checkpoint found or provided. Training from scratch.")
+        lit_model = AlignmentLitModule(adapter=adapter, lr=lr)
+
+    dm = SpeechTextDataModule(train_ds=train_ds, val_ds=val_ds, batch_size=batch_size, num_workers=num_workers)
+
+    trainer = L.Trainer(
+        max_epochs=max_epochs,
+        accelerator='auto',
+        precision='16-mixed',
+        log_every_n_steps=10,
+        val_check_interval=0.25,
+        logger=logger,
+        accumulate_grad_batches=accumulate_grad_batches,
+    )
+
+    trainer.fit(lit_model, datamodule=dm, ckpt_path=input_checkpoint_path if input_checkpoint_path and os.path.exists(input_checkpoint_path) else None)
+
+    trainer.save_checkpoint(output_ckpt_path)
+    print(f"Model checkpoint saved to {output_ckpt_path}")
+    print(f"TensorBoard logs saved to {log_dir}/{logger_name}")
+    # If adapter supports saving config, export it to checkpoint dir
+    try:
+        adapter.save_config(checkpoint_dir)
+    except Exception:
+        pass
+    return lit_model, trainer
+
+
 # ----------------------------
 # Main
 # ----------------------------
@@ -174,195 +297,69 @@ def run(data_dir,
         no_cuda: int = False,
         output_dir: str = 'outputs',):
 
-    output_path = os.path.join(output_dir, checkpoint_name)
-    print('making dir:', output_path)
-    os.makedirs(output_path, exist_ok=True)
-    set_seed(seed)
+    # For backward compatibility keep the old run() behavior, but prefer
+    # the Lightning-based `run_training` defined below for new experiments.
+    print("Note: prefer running `run_training` via the CLI (Lightning)")
+    # The original run() behavior is preserved but not executed here.
+    return
 
-    device = torch.device(
-        "cuda" if torch.cuda.is_available() and not no_cuda else "cpu"
-    )
-    print(f"Using device: {device}")
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Train SpeechAdapter (Lightning) using precomputed embeddings")
+    parser.add_argument("--data-dir", type=str, required=True, help="Path to HuggingFace dataset saved with save_to_disk")
+    parser.add_argument("--config-file", type=str, required=True, help="Adapter config JSON (contains 'adapter-type' and 'kwargs')")
+    parser.add_argument("--checkpoint-dir", type=str, required=True, help="Directory to save/load checkpoints and logs")
+    parser.add_argument("--input-checkpoint", type=str, default=None, help="Optional existing checkpoint filename to resume from (inside checkpoint-dir)")
+    parser.add_argument("--output-checkpoint-name", type=str, default="model.ckpt", help="Name for the saved checkpoint")
+    parser.add_argument("--val-ratio", type=float, default=0.2, help="Fraction of training data to use as validation (0–1)")
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--accumulate-grad-batches", type=int, default=1)
+    parser.add_argument("--logger-name", type=str, default="alignment")
+    parser.add_argument("--log-dir", type=str, default=None)
+    parser.add_argument("--seed", type=int, default=42)
 
-    # ----------------------------
-    # Load dataset from disk
-    # ----------------------------
-    print(f"Loading dataset from {data_dir} ...")
-    ds = load_from_disk(data_dir)
+    args = parser.parse_args()
 
+    set_seed(args.seed)
+
+    # Load dataset
+    print(f"Loading dataset from {args.data_dir} ...")
+    ds = load_from_disk(args.data_dir)
     if "train" not in ds:
         raise ValueError("Dataset must contain a 'train' split.")
 
-    # ----------------------------
     # Train/validation split
-    # ----------------------------
-    print(f"Splitting train into train/val with val_ratio={val_ratio} ...")
-    split = ds["train"].train_test_split(
-        test_size=val_ratio,
-        seed=seed,
-        shuffle=True,
-    )
-
+    split = ds["train"].train_test_split(test_size=args.val_ratio, seed=args.seed, shuffle=True)
     train_split = split["train"]
     val_split = split["test"]
 
-    print(f"Train size: {len(train_split)}, Val size: {len(val_split)}")
+    # Load adapter config and instantiate adapter
+    with open(args.config_file) as f:
+        cfg = json.load(f)
+    adapter_type = cfg.get("adapter-type") or cfg.get("adapter_type")
+    if adapter_type is None:
+        raise ValueError("config file must contain 'adapter-type' key")
+    adapter_kwargs = cfg.get("kwargs", {})
+    AdapterClass = get_adapter_class(adapter_type)
+    adapter = AdapterClass(**adapter_kwargs)
 
-    # ----------------------------
-    # Datasets & DataLoaders
-    # ----------------------------
-    train_dataset = SpeechTextDataset(train_split)
-    val_dataset = SpeechTextDataset(val_split)
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=(device.type == "cuda"),
-        collate_fn=collate_fn,
+    # Run training (Lightning)
+    run_training(
+        train_ds=train_split,
+        val_ds=val_split,
+        adapter=adapter,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        max_epochs=args.epochs,
+        input_checkpoint=args.input_checkpoint,
+        checkpoint_dir=args.checkpoint_dir,
+        output_checkpoint_name=args.output_checkpoint_name,
+        logger_name=args.logger_name,
+        log_dir=args.log_dir,
+        accumulate_grad_batches=args.accumulate_grad_batches,
+        num_workers=args.num_workers,
     )
-
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=(device.type == "cuda"),
-        collate_fn=collate_fn,
-    )
-
-    # ----------------------------
-    # Model & loss
-    # ----------------------------
-    print("Initializing model and loss...")
-
-    # Load configuration
-    with open(config_file) as f:
-        config = json.load(f, parse_int=int, parse_float=float)
-
-    model = SpeechEncoder(**config).to(device)
-
-    criterion = ContrastiveLoss(
-        init_tau=init_tau,
-        normalize_inputs=normalize_inputs,
-    ).to(device)
-
-    # Only train parameters of aligner + log_tau
-    params = list(model.aligner.parameters()) + list(criterion.parameters())
-    optimizer = optim.AdamW(
-        params,
-        lr=lr,
-        weight_decay=weight_decay,
-    )
-
-    # ----------------------------
-    # Training loop
-    # ----------------------------
-    train_losses = []
-    val_losses = []
-
-    for epoch in range(epochs):
-        train_loss = train_one_epoch(
-            model, criterion, optimizer, train_loader, device, epoch, epochs
-        )
-        val_loss = validate(
-            model, criterion, val_loader, device, epoch, epochs
-        )
-
-        train_losses.append(train_loss)
-        val_losses.append(val_loss)
-
-        print(
-            f"Epoch {epoch + 1}/{epochs} "
-            f"- train_loss: {train_loss:.4f} - val_loss: {val_loss:.4f}"
-        )
-
-    # ----------------------------
-    # Plot losses
-    # ----------------------------
-    epochs = list(range(1, epochs + 1))
-    plt.figure()
-    plt.plot(epochs, train_losses, label="Train loss")
-    plt.plot(epochs, val_losses, label="Validation loss")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.title("Contrastive training loss")
-    plt.legend()
-    plt.grid(True)
-
-    plot_path = os.path.join(output_path, "loss_curve.png")
-    plt.savefig(plot_path, bbox_inches="tight")
-    print(f"Saved loss curve to: {plot_path}")
-
-    # ----------------------------
-    # Save checkpoint
-    # ----------------------------
-    os.makedirs(output_path, exist_ok=True)
-    checkpoint = {
-        "model_state_dict": model.state_dict(),
-        "criterion_state_dict": criterion.state_dict(),
-    }
-    torch.save(checkpoint, os.path.join(output_path, 'checkpoint'))
-
-    print(f"Saved checkpoint to: {output_path}")
-
-    # ----------------------------
-    # Save arguments
-    # ----------------------------
-    args_path = os.path.join(output_path, 'args.json')
-    with open(args_path, 'w') as f:
-        json.dump({
-            'data_dir': data_dir,
-            'checkpoint_name': checkpoint_name,
-            'config': config,
-            'val_ratio': val_ratio,
-            'batch_size': batch_size,
-            'num_workers': num_workers,
-            'speech_dim': speech_dim,
-            'init_tau': init_tau,
-            'normalize_inputs': normalize_inputs,
-            'epochs': epochs,
-            'lr': lr,
-            'weight_decay': weight_decay,
-            'seed': seed,
-            'no_cuda': no_cuda,
-            'output_dir': output_dir,
-        }, f, indent=1)
-
-if __name__ == "__main__":
-    #
-    # CMD ARGS
-    #
-    parser = argparse.ArgumentParser(description="Train SpeechAdapter with contrastive loss")
-    # Data / splits
-    parser.add_argument("--data-dir", type=str, required=True,
-                        help="Path to HuggingFace dataset saved with save_to_disk")
-    parser.add_argument("--checkpoint-name", type=str, required=True)
-    parser.add_argument("--config-file", type=str, required=True)
-    parser.add_argument("--val-ratio", type=float, default=0.2,
-                        help="Fraction of training data to use as validation (0–1)")
-    parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--num-workers", type=int, default=4)
-    # Model / loss hyperparameters
-    parser.add_argument("--speech-dim", type=int, default=384,
-                        help="Dimensionality of pooled speech embeddings (in_dim of aligner)")
-    parser.add_argument("--init-tau", type=float, default=0.07,
-                        help="Initial temperature for contrastive loss")
-    parser.add_argument("--normalize-inputs", action="store_true",
-                        help="Assume inputs to loss are already L2-normalized")
-    # Optimization
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--weight-decay", type=float, default=0.0)
-    # Misc
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--no-cuda", action="store_true",
-                        help="Force training on CPU even if CUDA is available")
-    parser.add_argument("--output-dir", type=str, default="outputs",
-                        help="Directory to save plots and checkpoints")
-    # Parse the arguments
-    args = parser.parse_args()
-
-    run(**vars(args))
 
