@@ -65,38 +65,77 @@ def compute_embeddings(model, dataloader, device):
 # Recall@K
 # ---------------------------------------------------------
 
-def recall_at_k_batched(gt_embs, pred_embs, k, batch_size=256, device="cpu"):
+def compute_similarity_matrix(gt_embs, pred_embs, device="cpu", batch_size=256):
+    """Compute full similarity matrix S where S[i,j] = dot(gt_embs[i], pred_embs[j]).
+
+    Both input tensors are expected as 2D (N, D) and (M, D). The function
+    normalizes embeddings (L2) and computes the matrix in query batches to
+    limit peak memory usage.
+    """
+    if not isinstance(device, torch.device):
+        device = torch.device(device)
     n = gt_embs.shape[0]
-    hits = 0
+    m = pred_embs.shape[0]
+
+    # Pre-normalize pred embeddings and move to device once
+    pred_norm = pred_embs.to(device)
+    pred_norm = pred_norm / pred_norm.norm(dim=1, keepdim=True).clamp(min=1e-9)
+
+    sim = torch.empty((n, m), dtype=pred_norm.dtype, device=device)
+
+    for i in tqdm(range(0, n, batch_size), desc="Similarity matrix", dynamic_ncols=True):
+        batch_end = min(i + batch_size, n)
+        batch_gt = gt_embs[i:batch_end].to(device)
+        batch_gt = batch_gt / batch_gt.norm(dim=1, keepdim=True).clamp(min=1e-9)
+        sim[i:batch_end] = batch_gt @ pred_norm.T
+
+    return sim
+
+
+def recall_at_k_batched(sim_matrix, k, batch_size=256, device="cpu"):
+    """Compute Recall@k given a precomputed similarity matrix.
+
+    sim_matrix: torch.Tensor [N, M]
+    Returns fraction of queries whose correct index (diagonal) is in top-k.
+    """
+    if not isinstance(device, torch.device):
+        device = torch.device(device)
+    sim = sim_matrix.to(device)
+    n = sim.shape[0]
+    k_eff = min(k, sim.shape[1])
+    hits = 0.0
     for i in tqdm(range(0, n, batch_size), desc=f"Recall@{k}", dynamic_ncols=True):
-        batch_gt = gt_embs[i:i+batch_size].to(device)
-        # Normalize
-        batch_gt = batch_gt / batch_gt.norm(dim=1, keepdim=True)
-        pred_norm = pred_embs / pred_embs.norm(dim=1, keepdim=True)
-        # Compute similarity
-        sim = batch_gt @ pred_norm.T  # [B, N]
-        topk = torch.topk(sim, k=k, dim=1).indices
-        row_indices = torch.arange(i, min(i+batch_size, n)).unsqueeze(1).to(device)
+        batch = sim[i:i+batch_size]
+        topk = torch.topk(batch, k=k_eff, dim=1).indices
+        row_indices = torch.arange(i, i + batch.shape[0], device=device).unsqueeze(1)
         batch_hits = (topk == row_indices).any(dim=1).float().sum().item()
         hits += batch_hits
-    return hits / n
+    return float(hits) / float(n)
 
-def mrr_batched(gt_embs, pred_embs, batch_size=256, device="cpu"):
-    n = gt_embs.shape[0]
+def mrr_batched(sim_matrix, batch_size=256, device="cpu"):
+    """Compute Mean Reciprocal Rank (MRR) from a precomputed similarity matrix.
+
+    sim_matrix: torch.Tensor [N, M]
+    """
+    if not isinstance(device, torch.device):
+        device = torch.device(device)
+    sim = sim_matrix.to(device)
+    n = sim.shape[0]
     rr_sum = 0.0
     for i in tqdm(range(0, n, batch_size), desc="MRR", dynamic_ncols=True):
-        batch_gt = gt_embs[i:i+batch_size].to(device)
-        batch_size_actual = batch_gt.shape[0]
-        batch_indices = torch.arange(i, i+batch_size_actual).to(device)
-        # Normalize
-        batch_gt = batch_gt / batch_gt.norm(dim=1, keepdim=True)
-        pred_norm = pred_embs / pred_embs.norm(dim=1, keepdim=True)
-        sim = batch_gt @ pred_norm.T  # [B, N]
+        batch = sim[i:i+batch_size]
+        batch_size_actual = batch.shape[0]
+        batch_indices = torch.arange(i, i + batch_size_actual, device=device)
         # For each row, get the rank of the correct index
-        sorted_indices = torch.argsort(sim, dim=1, descending=True)
-        ranks = (sorted_indices == batch_indices.unsqueeze(1)).nonzero(as_tuple=False)[:,1] + 1
+        sorted_indices = torch.argsort(batch, dim=1, descending=True)
+        # Find positions where sorted_indices == batch_indices
+        # This yields positions (row, col) where col is the rank index
+        # We search per-row for the column equal to batch_indices
+        # To do this efficiently, compare and nonzero
+        matches = (sorted_indices == batch_indices.unsqueeze(1))
+        ranks = matches.float().argmax(dim=1) + 1  # 1-based rank
         rr_sum += (1.0 / ranks.float()).sum().item()
-    return rr_sum / n
+    return float(rr_sum) / float(n)
 
 
 def plot_recall_curve(recall_dict, mrr, output_path):
@@ -118,9 +157,9 @@ def plot_recall_curve(recall_dict, mrr, output_path):
 # Load model & config from checkpoint directory
 # ---------------------------------------------------------
 def load_model_from_checkpoint(ckpt_path, config):
-    # Select adapter type based on config
-    adapter_type = config.get("adapter_type", "cnn")
-    adapter_kwargs = config.get("kwargs", {})
+    # Select adapter type based only on `adapter-type` in config.json (preferred)
+    adapter_type = config.get("adapter-type", "cnn")
+    adapter_kwargs = config.get("kwargs", {}) if isinstance(config.get("kwargs", {}), dict) else {}
     AdapterClass = get_adapter_class(adapter_type)
     adapter = AdapterClass(**adapter_kwargs)
     model = AlignmentModel(adapter=adapter, init_tau=config.get("init_tau", 0.07))
@@ -163,7 +202,7 @@ def load_model_from_checkpoint(ckpt_path, config):
 # Main evaluation
 # ---------------------------------------------------------
 
-def main(ckpt_dir, ckpt_name, data_dir, k_values, batch_size=128, num_workers=4):
+def run(ckpt_dir, ckpt_name, data_dir, k_values, batch_size=128, num_workers=4):
     # Paths: config.json is expected to live in the same directory as the checkpoint
     config_path = os.path.join(ckpt_dir, "config.json")
     if not os.path.exists(config_path):
@@ -195,17 +234,20 @@ def main(ckpt_dir, ckpt_name, data_dir, k_values, batch_size=128, num_workers=4)
     # Compute all embeddings
     print("[INFO] Computing embeddings for test set...")
     gt_embs, pred_embs = compute_embeddings(model, test_loader, device)
-    gt_embs = gt_embs.to(device)
-    pred_embs = pred_embs.to(device)
-    # Evaluate recall@k in batches
+
+    # Compute full similarity matrix (queries x passages)
+    print("[INFO] Computing similarity matrix...")
+    sim_matrix = compute_similarity_matrix(gt_embs, pred_embs, device=device, batch_size=256)
+
+    # Evaluate recall@k in batches using the similarity matrix
     recall_scores = {}
     print("\n===== TEXT → SPEECH RETRIEVAL =====")
     for k in k_values:
-        score = recall_at_k_batched(gt_embs, pred_embs, k, batch_size=256, device=device)
+        score = recall_at_k_batched(sim_matrix, k, batch_size=256, device=device)
         recall_scores[k] = score
         print(f"Recall@{k}: {score:.4f}")
     # Evaluate MRR
-    mrr_score = mrr_batched(gt_embs, pred_embs, batch_size=256, device=device)
+    mrr_score = mrr_batched(sim_matrix, batch_size=256, device=device)
     print(f"MRR: {mrr_score:.4f}")
     # Output directory with checkpoint name
     checkpoint_name = os.path.splitext(os.path.basename(ckpt_path))[0]
@@ -235,7 +277,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=4)
     args = parser.parse_args()
-    main(
+    run(
         ckpt_dir=args.ckpt_dir,
         ckpt_name=args.ckpt_name,
         data_dir=args.data_dir,

@@ -10,6 +10,8 @@ import torch
 import torch.nn as nn, torch.nn.functional as F
 from itertools import pairwise
 from transformers import AutoModel
+import os
+import json
 
 def get_adapter_class(adapter_type):
     """
@@ -30,11 +32,12 @@ def get_adapter_class(adapter_type):
     match adapter_type:
         case "cnn":
             return CnnAdapter
-        case "linear":
-            return LinearAdapter
+        case "mlp":
+            return MlpAdapter
+        case "lstm":
+            return LstmAdapter
         case _:
             raise ValueError(f"Unknown adapter_type: {adapter_type}")
-
 
 def mean_pooling(hidden_state, mask):
     '''
@@ -68,32 +71,71 @@ def mean_pooling(hidden_state, mask):
     pooled = sum_hidden / lengths
     return pooled
 
-class LinearAdapter(nn.Module):
-    '''
-    Linear Adapter.
-    It's purpose is to transform a sequence of speech embedding vectors to pseudo-tokens
-    for the text encoder.
+class MlpAdapter(nn.Module):
+    """
+    MLP Adapter.
 
-    input: Tensor [B, L, speech_dim]
-    out: Tensor [B, L, text_dim]
-    '''
+    Maps per-frame speech embeddings to per-frame text-like embeddings using
+    a simple feed-forward network applied independently to each time step.
+
+    Input:  Tensor [B, T, speech_dim]
+    Output: Tensor [B, T, text_dim], mask unchanged
+    """
     def __init__(self,
-                 speech_dim = 384,
-                 text_dim = 384,
+                 speech_dim: int = 384,
+                 text_dim: int = 384,
+                 hidden_dim: int = 512,
+                 num_layers: int = 2,
+                 dropout: float = 0.1,
                  **kwargs):
 
         super().__init__()
 
-        # Make sure inputs are the correct type
         speech_dim = int(speech_dim)
         text_dim = int(text_dim)
+        hidden_dim = int(hidden_dim)
+        num_layers = int(num_layers)
 
-        self.linear_layer = nn.Linear(speech_dim, text_dim)
+        layers = []
+        in_dim = speech_dim
+        # Build (num_layers-1) hidden blocks, then final linear to text_dim
+        for i in range(max(0, num_layers - 1)):
+            layers.append(nn.Linear(in_dim, hidden_dim))
+            layers.append(nn.GELU())
+            layers.append(nn.Dropout(dropout))
+            in_dim = hidden_dim
+
+        # Final projection to text_dim
+        layers.append(nn.Linear(in_dim, text_dim))
+
+        self.net = nn.Sequential(*layers)
         self.speech_dim = speech_dim
         self.text_dim = text_dim
+        # store constructor args for config export
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.dropout_rate = float(dropout)
+        self._config = {
+            "speech_dim": int(speech_dim),
+            "text_dim": int(text_dim),
+            "hidden_dim": int(hidden_dim),
+            "num_layers": int(num_layers),
+            "dropout": float(self.dropout_rate),
+        }
+
+    def save_config(self, dir_path, filename="config.json"):
+        os.makedirs(dir_path, exist_ok=True)
+        cfg = {"adapter-type": "mlp", "kwargs": self._config}
+        with open(os.path.join(dir_path, filename), "w") as f:
+            json.dump(cfg, f, indent=4)
 
     def forward(self, speech_embs, attn_mask):
-        return self.linear_layer(speech_embs), attn_mask
+        # speech_embs: [B, T, D]
+        B, T, D = speech_embs.shape
+        x = speech_embs.reshape(-1, D)       # [B*T, D]
+        x = self.net(x)                      # [B*T, text_dim]
+        x = x.view(B, T, -1)                 # [B, T, text_dim]
+        return x, attn_mask
 
 class CnnAdapter(nn.Module):
     '''
@@ -148,11 +190,27 @@ class CnnAdapter(nn.Module):
         )
 
         self.proj = nn.Conv1d(in_channels, text_dim, kernel_size=1)
-        self.dropout = nn.Dropout(dropout)
+        self.dropout = nn.Dropout(float(dropout))
         self.act = nn.GELU()
 
         self.speech_dim = speech_dim
         self.text_dim = text_dim
+        # store constructor args for config export
+        self._config = {
+            "speech_dim": int(speech_dim),
+            "text_dim": int(text_dim),
+            "hidden_dim": int(hidden_dim),
+            "kernel_sizes": list(self.kernel_sizes),
+            "num_layers": int(num_layers),
+            "pooling_stride": int(self.pool_stride),
+            "dropout": float(dropout),
+        }
+
+    def save_config(self, dir_path, filename="config.json"):
+        os.makedirs(dir_path, exist_ok=True)
+        cfg = {"adapter-type": "cnn", "kwargs": self._config}
+        with open(os.path.join(dir_path, filename), "w") as f:
+            json.dump(cfg, f, indent=4)
 
     def forward(self, speech_embs, attn_mask):
         """
@@ -199,6 +257,72 @@ class CnnAdapter(nn.Module):
         )
         return mask.squeeze(1).long()
 
+class LstmAdapter(nn.Module):
+    """
+    LSTM Adapter.
+
+    Maps per-frame speech embeddings to per-frame text-like embeddings using
+    a bidirectional (optional) LSTM followed by a linear projection per timestep.
+
+    Input:  Tensor [B, T, speech_dim]
+    Output: Tensor [B, T, text_dim], mask unchanged
+    """
+    def __init__(self,
+                 speech_dim: int = 384,
+                 text_dim: int = 384,
+                 hidden_dim: int = 256,
+                 num_layers: int = 1,
+                 bidirectional: bool = False,
+                 dropout: float = 0.0,
+                 **kwargs):
+
+        super().__init__()
+
+        speech_dim = int(speech_dim)
+        text_dim = int(text_dim)
+        hidden_dim = int(hidden_dim)
+        num_layers = int(num_layers)
+        bidirectional = bool(bidirectional)
+        dropout = float(dropout)
+
+        self.lstm = nn.LSTM(
+            input_size=speech_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=bidirectional,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+
+        out_dim = hidden_dim * (2 if bidirectional else 1)
+        self.proj = nn.Linear(out_dim, text_dim)
+
+        self.speech_dim = speech_dim
+        self.text_dim = text_dim
+
+        # store constructor args for config export
+        self._config = {
+            "speech_dim": int(speech_dim),
+            "text_dim": int(text_dim),
+            "hidden_dim": int(hidden_dim),
+            "num_layers": int(num_layers),
+            "bidirectional": bool(bidirectional),
+            "dropout": float(dropout),
+        }
+
+    def save_config(self, dir_path, filename="config.json"):
+        os.makedirs(dir_path, exist_ok=True)
+        cfg = {"adapter-type": "lstm", "kwargs": self._config}
+        with open(os.path.join(dir_path, filename), "w") as f:
+            json.dump(cfg, f, indent=4)
+
+    def forward(self, speech_embs, attn_mask):
+        # speech_embs: [B, T, D]
+        x, _ = self.lstm(speech_embs)   # [B, T, out_dim]
+        x = self.proj(x)                # [B, T, text_dim]
+        return x, attn_mask
+
+
 class AlignmentModel(nn.Module):
     """
     Alignment model operating on precomputed embeddings.
@@ -213,6 +337,8 @@ class AlignmentModel(nn.Module):
         maps ``[B, T, speech_dim]`` → ``[B, T', text_dim]``.
     init_tau : float
         Initial temperature for contrastive loss (default: 0.07).
+    gamma : float
+        Weighting factor for the contrastive loss (default: 0.1).
     """
 
     def __init__(self,
