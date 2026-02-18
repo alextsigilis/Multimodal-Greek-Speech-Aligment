@@ -1,4 +1,14 @@
 #!/usr/bin/env python3
+#
+#   evaluate.py
+#
+# Evaluation pipeline for text→speech retrieval using the trained alignment model. 
+# Computes Recall@K and MRR metrics, and generates a recall curve plot. 
+# Designed to be memory-efficient by batching similarity computations.
+#
+# Author: Alexandros Tsingilis
+# Date: 02 Dec 2025
+#
 import os
 import json
 import torch
@@ -12,6 +22,24 @@ from torch.utils.data import DataLoader
 from models import mean_pooling, CnnAdapter, AlignmentModel
 from models import get_adapter_class
 from preprocess import run as precompute
+
+
+# ---------------------------------------------------------
+# Utility: Load config from JSON file
+# ---------------------------------------------------------
+def load_config_from_file(config_path):
+    """
+    Load adapter configuration from a JSON file.
+    Args:
+        config_path (str): Path to the JSON config file.
+    Returns:
+        dict: Configuration dictionary loaded from the file.
+    """
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Config file not found at {config_path}")
+    with open(config_path, 'r', encoding='utf-8') as f:
+        config = json.load(f)
+    return config
 
 
 # ---------------------------------------------------------
@@ -92,50 +120,41 @@ def compute_similarity_matrix(gt_embs, pred_embs, device="cpu", batch_size=256):
     return sim
 
 
-def recall_at_k_batched(sim_matrix, k, batch_size=256, device="cpu"):
+def compute_recall_at_k(sim_matrix, k, device="cpu"):
     """Compute Recall@k given a precomputed similarity matrix.
 
     sim_matrix: torch.Tensor [N, M]
-    Returns fraction of queries whose correct index (diagonal) is in top-k.
+    Returns fraction of queries whose correct index (diagonal) is in top-k, over the entire dataset.
     """
     if not isinstance(device, torch.device):
         device = torch.device(device)
     sim = sim_matrix.to(device)
     n = sim.shape[0]
     k_eff = min(k, sim.shape[1])
-    hits = 0.0
-    for i in tqdm(range(0, n, batch_size), desc=f"Recall@{k}", dynamic_ncols=True):
-        batch = sim[i:i+batch_size]
-        topk = torch.topk(batch, k=k_eff, dim=1).indices
-        row_indices = torch.arange(i, i + batch.shape[0], device=device).unsqueeze(1)
-        batch_hits = (topk == row_indices).any(dim=1).float().sum().item()
-        hits += batch_hits
+    # For all queries, check if the correct index is in the top-k
+    # Compute top-k indices for all queries
+    topk = torch.topk(sim, k=k_eff, dim=1).indices  # [N, k]
+    row_indices = torch.arange(n, device=device).unsqueeze(1)  # [N, 1]
+    hits = (topk == row_indices).any(dim=1).float().sum().item()
     return float(hits) / float(n)
 
-def mrr_batched(sim_matrix, batch_size=256, device="cpu"):
+def compute_mrr(sim_matrix, device="cpu"):
     """Compute Mean Reciprocal Rank (MRR) from a precomputed similarity matrix.
 
     sim_matrix: torch.Tensor [N, M]
+    Computes MRR over the entire dataset.
     """
     if not isinstance(device, torch.device):
         device = torch.device(device)
     sim = sim_matrix.to(device)
     n = sim.shape[0]
-    rr_sum = 0.0
-    for i in tqdm(range(0, n, batch_size), desc="MRR", dynamic_ncols=True):
-        batch = sim[i:i+batch_size]
-        batch_size_actual = batch.shape[0]
-        batch_indices = torch.arange(i, i + batch_size_actual, device=device)
-        # For each row, get the rank of the correct index
-        sorted_indices = torch.argsort(batch, dim=1, descending=True)
-        # Find positions where sorted_indices == batch_indices
-        # This yields positions (row, col) where col is the rank index
-        # We search per-row for the column equal to batch_indices
-        # To do this efficiently, compare and nonzero
-        matches = (sorted_indices == batch_indices.unsqueeze(1))
-        ranks = matches.float().argmax(dim=1) + 1  # 1-based rank
-        rr_sum += (1.0 / ranks.float()).sum().item()
-    return float(rr_sum) / float(n)
+    # For all queries, get the rank of the correct index
+    sorted_indices = torch.argsort(sim, dim=1, descending=True)  # [N, M]
+    row_indices = torch.arange(n, device=device).unsqueeze(1)  # [N, 1]
+    matches = (sorted_indices == row_indices)
+    ranks = matches.float().argmax(dim=1) + 1  # 1-based rank
+    mrr = (1.0 / ranks.float()).mean().item()
+    return mrr
 
 
 def plot_recall_curve(recall_dict, mrr, output_path):
@@ -205,10 +224,7 @@ def load_model_from_checkpoint(ckpt_path, config):
 def run(ckpt_dir, ckpt_name, data_dir, k_values, batch_size=128, num_workers=4):
     # Paths: config.json is expected to live in the same directory as the checkpoint
     config_path = os.path.join(ckpt_dir, "config.json")
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f"Config file not found at {config_path}")
-    with open(config_path) as f:
-        config = json.load(f)
+    config = load_config_from_file(config_path)
     # Full checkpoint path
     ckpt_path = os.path.join(ckpt_dir, ckpt_name)
     if not os.path.exists(ckpt_path):
@@ -243,11 +259,11 @@ def run(ckpt_dir, ckpt_name, data_dir, k_values, batch_size=128, num_workers=4):
     recall_scores = {}
     print("\n===== TEXT → SPEECH RETRIEVAL =====")
     for k in k_values:
-        score = recall_at_k_batched(sim_matrix, k, batch_size=256, device=device)
+        score = compute_recall_at_k(sim_matrix, k, device=device)
         recall_scores[k] = score
         print(f"Recall@{k}: {score:.4f}")
     # Evaluate MRR
-    mrr_score = mrr_batched(sim_matrix, batch_size=256, device=device)
+    mrr_score = compute_mrr(sim_matrix, device=device)
     print(f"MRR: {mrr_score:.4f}")
     # Output directory with checkpoint name
     checkpoint_name = os.path.splitext(os.path.basename(ckpt_path))[0]

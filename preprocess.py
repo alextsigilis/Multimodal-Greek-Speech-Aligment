@@ -21,6 +21,8 @@ BASE = '/mnt/h'
 SAVE_DIR = 'hparl_precomputed'
 SE_MODEL_ID = 'openai/whisper-tiny'
 TE_MODEL_ID = 'intfloat/multilingual-e5-small'
+KERNEL_SIZE = 8
+STRIDE = 4
 BATCH_SIZE = 256
 TARGET_SR = 16_000  # 16kHz
 
@@ -190,6 +192,78 @@ def embed_transcripts(encoder, batch, batch_size=BATCH_SIZE):
         convert_to_tensor=True
     )
 
+def preprocess_batch(batch,
+                     speech_preprocessor,
+                     speech_model,
+                     te_model,
+                     device,
+                     target_sr=TARGET_SR,
+                     kernel_size=KERNEL_SIZE,
+                     stride=STRIDE,
+                     batch_size=BATCH_SIZE):
+    
+    """
+    Preprocess a batch of audio and transcript data to produce pooled speech embeddings, attention masks, and transcript embeddings.
+
+    Parameters
+    ----------
+    batch : dict
+        Batch from the dataset containing 'audio' and 'sentence' fields.
+    speech_preprocessor : AutoFeatureExtractor
+        Feature extractor for the speech encoder.
+    speech_model : AutoModel
+        Pretrained speech model (e.g., Whisper).
+    te_model : SentenceTransformer
+        Pretrained text encoder (e.g., multilingual-e5-small).
+    target_sr : int
+        Target sampling rate for audio.
+    kernel_size : int
+        Pooling window size for temporal pooling.
+    stride : int
+        Pooling stride for temporal pooling.
+    batch_size : int
+        Batch size for text encoder.
+    device : str
+        Device to run inference on ('cuda' or 'cpu').
+
+    Returns
+    -------
+    dict
+        Dictionary with keys:
+            'pooled_speech_embeddings': List of pooled speech embeddings (float)
+            'pooled_attn_masks': List of pooled attention masks (int)
+            'transcript_embeddings': List of transcript embeddings (float)
+    """
+    # Resample audio to the target sampling rate
+    speech = resample(batch, target_sr)
+    # Extract speech embeddings and attention masks from the speech model
+    speech_emb, attn_mask = embed_speech(
+        speech_preprocessor,
+        speech_model,
+        speech,
+        target_sr,
+        device
+    )
+    # Pool speech embeddings and downsample attention masks
+    pooled_emb, new_mask = masked_mean_pool_time(
+        speech_emb,
+        attn_mask,
+        kernel_size=kernel_size,
+        stride=stride
+    )
+    # Encode transcript sentences into normalized embeddings
+    transcript_emb = embed_transcripts(
+        te_model,
+        batch,
+        batch_size=batch_size
+    )
+    # Convert tensors to lists for storage in datasets
+    return {
+        'pooled_speech_embeddings': pooled_emb.tolist(),
+        'pooled_attn_masks': new_mask.tolist(),
+        'transcript_embeddings': transcript_emb.tolist(),
+    }
+
 def run(
     base: str = BASE,
     save_dir: str = SAVE_DIR,
@@ -269,43 +343,22 @@ def run(
     _, time_dim, speech_dim = pooled_test_sp_emb.size()
     _, text_dim = test_txt_emb.size()
 
-    def precompute(batch):
-        speech = resample(batch, target_sr)
-
-        speech_emb, attn_mask = embed_speech(
-            speech_preprocessor,
-            speech_model,
-            speech,
-            target_sr,
-            device
-        )
-
-        pooled_emb, new_mask = masked_mean_pool_time(
-            speech_emb,
-            attn_mask,
-            kernel_size=kernel_size,
-            stride=stride
-        )
-
-        transcript_emb = embed_transcripts(
-            te_model,
-            batch,
-            batch_size=batch_size
-        )
-
-        # ↓↓↓ FINAL STORAGE DTYPES ↓↓↓
-        return {
-            'pooled_speech_embeddings': pooled_emb.tolist(),
-            'pooled_attn_masks': new_mask.tolist(),
-            'transcript_embeddings': transcript_emb.tolist(),
-        }
-
     features = Features({
         'pooled_speech_embeddings': Array2D(shape=(time_dim, speech_dim),
                                             dtype='float16'),
         'pooled_attn_masks': Sequence(Value('int16')),
         'transcript_embeddings': Sequence(Value('float16'))
     })
+
+    precompute = lambda batch: preprocess_batch(batch,
+                                                speech_preprocessor,
+                                                speech_model,
+                                                te_model,
+                                                target_sr,
+                                                kernel_size,
+                                                stride,
+                                                batch_size,
+                                                device)
 
     tmp = orig_ds.map(
         precompute,
@@ -318,20 +371,21 @@ def run(
     )
 
     clean = DatasetDict({
-        name: split.remove_columns([
-            c for c in split.column_names
-            if c not in [
-                'pooled_speech_embeddings',
-                'pooled_attn_masks',
-                'transcript_embeddings'
-            ]
+        name: split.remove_columns([c for c in split.column_names
+                                    if c not in ['pooled_speech_embeddings',
+                                                 'pooled_attn_masks',
+                                                 'transcript_embeddings',
+                                                 'utt_id']
         ])
         for name, split in tmp.items()
     })
 
-    clean.save_to_disk(f"{base}/{save_dir}")
+    # Check if save_dir exists. If not create it
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+    clean.save_to_disk(save_dir)
     print("Saved.")
-    return clean
+    return tmp
 
 
 if __name__ == '__main__':

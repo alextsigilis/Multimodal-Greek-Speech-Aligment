@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn, torch.nn.functional as F
 from itertools import pairwise
 from transformers import AutoModel
+from sentence_transformers import SentenceTransformer
 import os
 import json
 
@@ -36,8 +37,63 @@ def get_adapter_class(adapter_type):
             return MlpAdapter
         case "lstm":
             return LstmAdapter
+        case "e5mlp":
+            return E5MLPAdapter
         case _:
             raise ValueError(f"Unknown adapter_type: {adapter_type}")
+
+class E5MLPAdapter(nn.Module):
+    """
+    Adapter that passes speech_embs through a 1-layer MLP with dropout, then as pseudo token embeddings into multilingual-e5-small, returning the pooled embedding vector.
+    """
+    def __init__(self,
+                 speech_dim: int = 384,
+                 text_dim: int = 384,
+                 dropout: float = 0.1,
+                 e5_model_name: str = "intfloat/multilingual-e5-small",
+                 device: str = "cuda",
+                 **kwargs):
+        super().__init__()
+        self.speech_dim = int(speech_dim)
+        self.text_dim = int(text_dim)
+        self.dropout = nn.Dropout(float(dropout))
+        self.linear = nn.Linear(self.speech_dim, self.text_dim)
+        self.e5 = SentenceTransformer(e5_model_name, device=device)
+        # Freeze all parameters of the E5 encoder
+        for param in self.e5.parameters():
+            param.requires_grad = False
+        self._config = {
+            "speech_dim": self.speech_dim,
+            "text_dim": self.text_dim,
+            "dropout": float(dropout),
+            "e5_model_name": e5_model_name,
+        }
+
+    def save_config(self, dir_path, filename="config.json"):
+        os.makedirs(dir_path, exist_ok=True)
+        cfg = {"adapter-type": "e5mlp", "kwargs": self._config}
+        with open(os.path.join(dir_path, filename), "w") as f:
+            json.dump(cfg, f, indent=4)
+
+    def forward(self, speech_embs, attn_mask):
+        # speech_embs: [B, T, D]
+        # attn_mask: [B, T]
+        x = self.linear(speech_embs)  # [B, T, text_dim]
+        x = self.dropout(x)
+        # The E5 model expects input as [B, T, text_dim] and an attention mask [B, T]
+        # We'll use the E5 encoder directly, treating x as token embeddings
+        # This requires accessing the transformer model's forward method
+        # We'll use the encode method with is_pretokenized=True and pass embeddings directly
+        # But SentenceTransformer does not support direct embedding input, so we use the underlying transformer
+        # We'll use the transformer model's forward method
+        # Get the transformer model
+        transformer = self.e5._first_module().auto_model
+        # Prepare inputs
+        # x: [B, T, text_dim], attn_mask: [B, T]
+        outputs = transformer(inputs_embeds=x, attention_mask=attn_mask)
+        # outputs.last_hidden_state: [B, T, H]
+        pooled = mean_pooling(outputs.last_hidden_state, attn_mask)
+        return pooled, attn_mask
 
 def mean_pooling(hidden_state, mask):
     '''
