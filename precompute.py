@@ -6,6 +6,7 @@ import numpy as np
 from datasets import load_dataset, DatasetDict, Features, Array2D, Sequence, Value
 from transformers import AutoModel, AutoFeatureExtractor
 from sentence_transformers import SentenceTransformer
+import torch.nn.functional as F
 
 BASE = '/mnt/h'
 SAVE_DIR = 'hparl_precomputed'
