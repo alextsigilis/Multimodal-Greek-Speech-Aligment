@@ -1,14 +1,5 @@
 #!/usr/bin/env python3
-#
-#   evaluate.py
-#
-# Evaluation pipeline for text→speech retrieval using the trained alignment model. 
-# Computes Recall@K and MRR metrics, and generates a recall curve plot. 
-# Designed to be memory-efficient by batching similarity computations.
-#
-# Author: Alexandros Tsingilis
-# Date: 02 Dec 2025
-#
+
 import os
 import json
 import torch
@@ -21,32 +12,8 @@ from torch.utils.data import DataLoader
 
 from models import mean_pooling, CnnAdapter, AlignmentModel
 from models import get_adapter_class
-from preprocess import run as precompute
+from utils import load_config_from_file
 
-
-# ---------------------------------------------------------
-# Utility: Load config from JSON file
-# ---------------------------------------------------------
-def load_config_from_file(config_path):
-    """
-    Load adapter configuration from a JSON file.
-    Args:
-        config_path (str): Path to the JSON config file.
-    Returns:
-        dict: Configuration dictionary loaded from the file.
-    """
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f"Config file not found at {config_path}")
-    with open(config_path, 'r', encoding='utf-8') as f:
-        config = json.load(f)
-    return config
-
-
-# ---------------------------------------------------------
-# Embedding computation with progress bar
-# ---------------------------------------------------------
-
-# Dataset wrapper (from train.py)
 class SpeechTextDataset(torch.utils.data.Dataset):
     def __init__(self, hf_split):
         self.ds = hf_split
@@ -88,24 +55,12 @@ def compute_embeddings(model, dataloader, device):
         all_speech.append(pred_output['speech_emb'].cpu())
     return torch.cat(all_text), torch.cat(all_speech)
 
-
-# ---------------------------------------------------------
-# Recall@K
-# ---------------------------------------------------------
-
 def compute_similarity_matrix(gt_embs, pred_embs, device="cpu", batch_size=256):
-    """Compute full similarity matrix S where S[i,j] = dot(gt_embs[i], pred_embs[j]).
-
-    Both input tensors are expected as 2D (N, D) and (M, D). The function
-    normalizes embeddings (L2) and computes the matrix in query batches to
-    limit peak memory usage.
-    """
     if not isinstance(device, torch.device):
         device = torch.device(device)
     n = gt_embs.shape[0]
     m = pred_embs.shape[0]
 
-    # Pre-normalize pred embeddings and move to device once
     pred_norm = pred_embs.to(device)
     pred_norm = pred_norm / pred_norm.norm(dim=1, keepdim=True).clamp(min=1e-9)
 
@@ -119,43 +74,28 @@ def compute_similarity_matrix(gt_embs, pred_embs, device="cpu", batch_size=256):
 
     return sim
 
-
 def compute_recall_at_k(sim_matrix, k, device="cpu"):
-    """Compute Recall@k given a precomputed similarity matrix.
-
-    sim_matrix: torch.Tensor [N, M]
-    Returns fraction of queries whose correct index (diagonal) is in top-k, over the entire dataset.
-    """
     if not isinstance(device, torch.device):
         device = torch.device(device)
     sim = sim_matrix.to(device)
     n = sim.shape[0]
     k_eff = min(k, sim.shape[1])
-    # For all queries, check if the correct index is in the top-k
-    # Compute top-k indices for all queries
-    topk = torch.topk(sim, k=k_eff, dim=1).indices  # [N, k]
-    row_indices = torch.arange(n, device=device).unsqueeze(1)  # [N, 1]
+    topk = torch.topk(sim, k=k_eff, dim=1).indices
+    row_indices = torch.arange(n, device=device).unsqueeze(1)
     hits = (topk == row_indices).any(dim=1).float().sum().item()
     return float(hits) / float(n)
 
 def compute_mrr(sim_matrix, device="cpu"):
-    """Compute Mean Reciprocal Rank (MRR) from a precomputed similarity matrix.
-
-    sim_matrix: torch.Tensor [N, M]
-    Computes MRR over the entire dataset.
-    """
     if not isinstance(device, torch.device):
         device = torch.device(device)
     sim = sim_matrix.to(device)
     n = sim.shape[0]
-    # For all queries, get the rank of the correct index
-    sorted_indices = torch.argsort(sim, dim=1, descending=True)  # [N, M]
-    row_indices = torch.arange(n, device=device).unsqueeze(1)  # [N, 1]
+    sorted_indices = torch.argsort(sim, dim=1, descending=True)
+    row_indices = torch.arange(n, device=device).unsqueeze(1)
     matches = (sorted_indices == row_indices)
-    ranks = matches.float().argmax(dim=1) + 1  # 1-based rank
+    ranks = matches.float().argmax(dim=1) + 1
     mrr = (1.0 / ranks.float()).mean().item()
     return mrr
-
 
 def plot_recall_curve(recall_dict, mrr, output_path):
     ks = list(recall_dict.keys())
@@ -171,25 +111,17 @@ def plot_recall_curve(recall_dict, mrr, output_path):
     plt.savefig(output_path, bbox_inches="tight")
     print(f"[OK] Saved plot → {output_path}")
 
-
-# ---------------------------------------------------------
-# Load model & config from checkpoint directory
-# ---------------------------------------------------------
 def load_model_from_checkpoint(ckpt_path, config):
-    # Select adapter type based only on `adapter-type` in config.json (preferred)
     adapter_type = config.get("adapter-type", "cnn")
     adapter_kwargs = config.get("kwargs", {}) if isinstance(config.get("kwargs", {}), dict) else {}
     AdapterClass = get_adapter_class(adapter_type)
     adapter = AdapterClass(**adapter_kwargs)
     model = AlignmentModel(adapter=adapter, init_tau=config.get("init_tau", 0.07))
     checkpoint = torch.load(ckpt_path, map_location="cpu")
-    # Handle LightningModule checkpoints with 'model.' prefix
     state_dict = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint["model_state_dict"]
-    # If keys are prefixed with 'model.', strip it
     if any(k.startswith("model.") for k in state_dict.keys()):
         new_state_dict = {k.replace("model.", "", 1): v for k, v in state_dict.items()}
         state_dict = new_state_dict
-    # Try strict loading first; if shapes mismatch, fall back to selective loading
     try:
         model.load_state_dict(state_dict)
     except RuntimeError as e:
@@ -204,7 +136,6 @@ def load_model_from_checkpoint(ckpt_path, config):
                 else:
                     skipped.append((k, v.shape, model_state[k].shape))
             else:
-                # unexpected key in checkpoint
                 skipped.append((k, v.shape, None))
         if compatible_state:
             model.load_state_dict(compatible_state, strict=False)
@@ -217,25 +148,17 @@ def load_model_from_checkpoint(ckpt_path, config):
             raise RuntimeError("No compatible parameters found to load from checkpoint.")
     model.eval()
     return model
-# ---------------------------------------------------------
-# Main evaluation
-# ---------------------------------------------------------
 
 def run(ckpt_dir, ckpt_name, data_dir, k_values, batch_size=128, num_workers=4):
-    # Paths: config.json is expected to live in the same directory as the checkpoint
     config_path = os.path.join(ckpt_dir, "config.json")
     config = load_config_from_file(config_path)
-    # Full checkpoint path
     ckpt_path = os.path.join(ckpt_dir, ckpt_name)
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f"Checkpoint not found at {ckpt_path}")
-    # Load model
     model = load_model_from_checkpoint(ckpt_path, config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[INFO] Using device: {device}")
     model = model.to(device)
-    # Load dataset
-    print(f"[INFO] Loading dataset from {data_dir} ...")
     ds = load_from_disk(data_dir)
     if "test" not in ds:
         raise ValueError("Dataset must include a 'test' split.")
@@ -247,42 +170,31 @@ def run(ckpt_dir, ckpt_name, data_dir, k_values, batch_size=128, num_workers=4):
         num_workers=num_workers,
         collate_fn=collate_fn
     )
-    # Compute all embeddings
-    print("[INFO] Computing embeddings for test set...")
     gt_embs, pred_embs = compute_embeddings(model, test_loader, device)
-
-    # Compute full similarity matrix (queries x passages)
-    print("[INFO] Computing similarity matrix...")
     sim_matrix = compute_similarity_matrix(gt_embs, pred_embs, device=device, batch_size=256)
 
-    # Evaluate recall@k in batches using the similarity matrix
     recall_scores = {}
     print("\n===== TEXT → SPEECH RETRIEVAL =====")
     for k in k_values:
         score = compute_recall_at_k(sim_matrix, k, device=device)
         recall_scores[k] = score
         print(f"Recall@{k}: {score:.4f}")
-    # Evaluate MRR
     mrr_score = compute_mrr(sim_matrix, device=device)
     print(f"MRR: {mrr_score:.4f}")
-    # Output directory with checkpoint name
+
     checkpoint_name = os.path.splitext(os.path.basename(ckpt_path))[0]
     output_dir = os.path.join(os.path.dirname(ckpt_path), f"evaluation_results_{checkpoint_name}")
     os.makedirs(output_dir, exist_ok=True)
-    # Save results as CSV
+
     df = pd.DataFrame({"k": list(recall_scores.keys()), "recall": list(recall_scores.values())})
     df.to_csv(os.path.join(output_dir, "recall_at_k.csv"), index=False)
     with open(os.path.join(output_dir, "metrics.json"), "w") as f:
         json.dump({"recall": recall_scores, "mrr": mrr_score}, f, indent=2)
-    # Plot
+
     plot_recall_curve(recall_scores, mrr_score, os.path.join(output_dir, "recall_curve_text_to_speech.png"))
     print(f"[OK] Results saved to {output_dir}")
     return recall_scores, mrr_score
 
-
-# ---------------------------------------------------------
-# CLI
-# ---------------------------------------------------------
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Text→Speech Retrieval Evaluation")
@@ -301,4 +213,3 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         num_workers=args.num_workers
     )
-
