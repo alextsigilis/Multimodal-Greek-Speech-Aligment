@@ -355,7 +355,11 @@ def run(
             "batch_size": batch_size
         },
         load_from_cache_file=True,
-        cache_file_names=cache_file_names,
+        cache_file_names={
+            "train": f"{ds_dir}/train.arrow",
+            "test": f"{ds_dir}/test.arrow",
+            "validation": f"{ds_dir}/validation.arrow"
+        },
         desc="Precomputing pooled speech + text embeddings"
     )
 
