@@ -11,20 +11,22 @@ import argparse
 import torch
 import librosa
 import numpy as np
-from datasets import load_dataset, DatasetDict, Features, Array2D, Sequence, Value
+import torch.nn.functional as F
+from datasets import DatasetDict, Features, Array2D, Sequence, Value, load_dataset
 from transformers import AutoModel, AutoFeatureExtractor
 from sentence_transformers import SentenceTransformer
-import torch.nn.functional as F
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Default arguments
-BASE = '/mnt/h'
-SAVE_DIR = 'hparl_precomputed'
 SE_MODEL_ID = 'openai/whisper-tiny'
 TE_MODEL_ID = 'intfloat/multilingual-e5-small'
 KERNEL_SIZE = 8
 STRIDE = 4
 BATCH_SIZE = 256
-TARGET_SR = 16_000  # 16kHz
+TARGET_SR = 16_000  # 16000
 
 
 def resample(batch, target_sr):
@@ -47,6 +49,8 @@ def resample(batch, target_sr):
     audios = batch['audio']
     waveforms = [np.array(audio['array']) for audio in audios]
     sampling_rates = [audio['sampling_rate'] for audio in audios]
+    
+    # Resample each waveform to target_sr
     speech = [
         librosa.resample(wf, orig_sr=sr, target_sr=target_sr)
         for wf, sr in zip(waveforms, sampling_rates)
@@ -69,7 +73,7 @@ def embed_speech(preprocessor, model, speech, sr, device):
     sr : int
         Sampling rate of the waveforms.
     device : str
-        Device to run inference on (``'cuda'`` or ``'cpu'``).
+        Device to run inference on (``'cuda'``, ``'mps'``, or ``'cpu'``).
 
     Returns
     -------
@@ -78,6 +82,7 @@ def embed_speech(preprocessor, model, speech, sr, device):
     attn_mask : torch.Tensor
         Attention mask of shape ``[B, T]`` (CPU, int16).
     """
+    # Ensure we're passing the correct sampling rate to the preprocessor
     inputs = preprocessor(
         speech,
         sampling_rate=sr,
@@ -224,7 +229,7 @@ def preprocess_batch(batch,
     batch_size : int
         Batch size for text encoder.
     device : str
-        Device to run inference on ('cuda' or 'cpu').
+        Device to run inference on ('cuda', 'mps', or 'cpu').
 
     Returns
     -------
@@ -264,33 +269,33 @@ def preprocess_batch(batch,
         'transcript_embeddings': transcript_emb.tolist(),
     }
 
+def get_device():
+    """Detect and return the best available device (cuda, mps, or cpu)."""
+    if torch.cuda.is_available():
+        return "cuda"
+    elif torch.backends.mps.is_available() and torch.backends.mps.is_built():
+        return "mps"
+    else:
+        return "cpu"
+
 def run(
-    base: str = BASE,
-    save_dir: str = SAVE_DIR,
-    speech_encoder: str = SE_MODEL_ID,
-    text_encoder: str = TE_MODEL_ID,
+    dataset_url: str,
     target_sr: int = TARGET_SR,
     kernel_size: int = 8,
     stride: int = 4,
-    batch_size: int = BATCH_SIZE
+    batch_size: int = BATCH_SIZE,
+    cache_dir: str = "./cache"
 ):
     """Run the full preprocessing pipeline.
 
-    Loads the raw ``ddamianos/hparl`` dataset, computes pooled Whisper
+    Loads the raw dataset from dataset_url, computes pooled Whisper
     encoder embeddings for speech and normalised E5 embeddings for
     transcripts, then saves the result as an Arrow dataset.
 
     Parameters
     ----------
-    base : str
-        Root directory for HuggingFace caches and output.
-    save_dir : str
-        Sub-directory under *base* where the precomputed dataset is saved.
-    speech_encoder : str
-        HuggingFace model ID for the speech encoder (default: whisper-tiny).
-    text_encoder : str
-        HuggingFace model ID for the text encoder (default:
-        multilingual-e5-small).
+    dataset_url : str
+        HuggingFace dataset URL to load.
     target_sr : int
         Target sampling rate for audio resampling (default: 16000).
     kernel_size : int
@@ -299,6 +304,8 @@ def run(
         Temporal pooling stride (default: 4).
     batch_size : int
         Batch size for dataset ``.map()`` and encoder inference.
+    cache_dir : str
+        Directory to store cached files (default: "./cache").
 
     Returns
     -------
@@ -306,27 +313,17 @@ def run(
         The precomputed dataset with columns ``pooled_speech_embeddings``,
         ``pooled_attn_masks``, and ``transcript_embeddings``.
     """
-    # HuggingFace caches
-    os.environ["HF_DATASETS_CACHE"] = f"{base}/datasets"
-    os.environ["HF_HOME"] = base
-    os.environ["TRANSFORMERS_CACHE"] = f"{base}/models"
-
-    # Load dataset
-    orig_ds = load_dataset(
-        'ddamianos/hparl',
-        cache_dir=os.environ["HF_DATASETS_CACHE"]
-    )
-
     # Encoders
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = get_device()
     print(f"Using {device}")
 
-    speech_preprocessor = AutoFeatureExtractor.from_pretrained(speech_encoder)
-    speech_model = AutoModel.from_pretrained(speech_encoder).to(device).eval()
-    te_model = SentenceTransformer(text_encoder, device=device)
+    speech_preprocessor = AutoFeatureExtractor.from_pretrained(SE_MODEL_ID)
+    speech_model = AutoModel.from_pretrained(SE_MODEL_ID).to(device).eval()
+    te_model = SentenceTransformer(TE_MODEL_ID, device=device)
 
     # Find out resulting shapes
-    test_batch = orig_ds['test'][0:1]
+    dataset = load_dataset(dataset_url)
+    test_batch = dataset['test'][0:1]
     test_speech = resample(test_batch, target_sr)
     test_sp_emb, test_attn_mask = embed_speech(speech_preprocessor,
                                                speech_model,
@@ -343,64 +340,58 @@ def run(
     _, time_dim, speech_dim = pooled_test_sp_emb.size()
     _, text_dim = test_txt_emb.size()
 
-    features = Features({
-        'pooled_speech_embeddings': Array2D(shape=(time_dim, speech_dim),
-                                            dtype='float16'),
-        'pooled_attn_masks': Sequence(Value('int16')),
-        'transcript_embeddings': Sequence(Value('float16'))
-    })
+    # Remove features specification to let datasets handle types automatically
+    # This prevents the KeyError: 'path' issue by not forcing specific feature types
 
-    precompute = lambda batch: preprocess_batch(batch,
-                                                speech_preprocessor,
-                                                speech_model,
-                                                te_model,
-                                                target_sr,
-                                                kernel_size,
-                                                stride,
-                                                batch_size,
-                                                device)
+    cache_file_names = {
+        split: f"{cache_dir}/{dataset_url.replace('/', '--')}_{split}_{TE_MODEL_ID.replace('/', '--')}_{SE_MODEL_ID.replace('/', '--')}_sr{target_sr}_ksz{kernel_size}_strd{stride}.arrow"
+        for split in dataset.keys()
+    }
 
-    tmp = orig_ds.map(
-        precompute,
+    tmp = dataset.map(
+        preprocess_batch,
         batched=True,
         batch_size=batch_size,
         num_proc=None,
-        features=features,
-        remove_columns=orig_ds['train'].column_names,
+        fn_kwargs={
+            "speech_preprocessor": speech_preprocessor,
+            "speech_model": speech_model,
+            "te_model": te_model,
+            "device": device,
+            "target_sr": target_sr,
+            "kernel_size": kernel_size,
+            "stride": stride,
+            "batch_size": batch_size
+        },
+        load_from_cache_file=True,
+        cache_file_names=cache_file_names,
         desc="Precomputing pooled speech + text embeddings"
     )
 
     clean = DatasetDict({
-        name: split.remove_columns([c for c in split.column_names
-                                    if c not in ['pooled_speech_embeddings',
-                                                 'pooled_attn_masks',
-                                                 'transcript_embeddings',
-                                                 'utt_id']
-        ])
+        name: split
         for name, split in tmp.items()
     })
 
-    # Check if save_dir exists. If not create it
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
-    clean.save_to_disk(save_dir)
-    print("Saved.")
-    return tmp
+    # Cache the dataset using Hugging Face's built-in caching instead of save_to_disk
+    # The dataset will be cached automatically by Hugging Face
+    print("Dataset preprocessed and cached automatically by Hugging Face.")
+    
+    return clean
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description="Precompute pooled speech embeddings (fp16 embeddings, int16 masks)"
+        description="Precompute pooled speech embeddings (fp16 embeddings, int16 masks) from HuggingFace datasets containing 'sentence' and 'audio' columns. The audio column must be cast to Audio type."
     )
-    parser.add_argument("--base", default=BASE)
-    parser.add_argument("--save-dir", default=SAVE_DIR)
-    parser.add_argument("-se", "--speech-encoder", default=SE_MODEL_ID)
-    parser.add_argument("-te", "--text-encoder", default=TE_MODEL_ID)
-    parser.add_argument("-sr", "--target-sr", default=TARGET_SR)
-    parser.add_argument("--kernel-size", default=8, type=int)
-    parser.add_argument("--stride", default=4, type=int)
-    parser.add_argument("--batch-size", default=BATCH_SIZE, type=int)
+    parser.add_argument("--dataset-url", required=True, help="HuggingFace dataset URL")
+    parser.add_argument("--target-sr", default=TARGET_SR, type=int, help="Target sampling rate for audio resampling (default: 16000)")
+    parser.add_argument("--kernel-size", default=KERNEL_SIZE, type=int, help="Temporal pooling window size applied to pooled speech embeddings (default: 8)")
+    parser.add_argument("--stride", default=STRIDE, type=int, help="Temporal pooling stride applied to pooled speech embeddings (default: 4)")
+    parser.add_argument("--batch-size", default=BATCH_SIZE, type=int, help="Batch size for dataset .map() and encoder inference (default: 256)")
+    parser.add_argument("--cache-dir", default="./cache", help="Directory to store cached files (default: ./cache)")
 
     args = parser.parse_args()
+    
+    # Load the dataset using the HuggingFace datasets library
     run(**vars(args))
-
