@@ -23,11 +23,6 @@ load_dotenv()
 # Default arguments
 SE_MODEL_ID = 'openai/whisper-tiny'
 TE_MODEL_ID = 'intfloat/multilingual-e5-small'
-KERNEL_SIZE = 8
-STRIDE = 4
-BATCH_SIZE = 256
-TARGET_SR = 16_000  # 16000
-
 
 def resample(batch, target_sr):
     """Resample a batch of audio waveforms to the target sampling rate.
@@ -166,7 +161,7 @@ def clean_text(text):
     return text
 
 
-def embed_transcripts(encoder, batch, batch_size=BATCH_SIZE):
+def embed_transcripts(encoder, batch, batch_size=4):
     """Encode transcript sentences into normalised E5 embeddings.
 
     Each sentence is cleaned via :func:`clean_text`, prepended with the
@@ -202,10 +197,10 @@ def preprocess_batch(batch,
                      speech_model,
                      te_model,
                      device,
-                     target_sr=TARGET_SR,
-                     kernel_size=KERNEL_SIZE,
-                     stride=STRIDE,
-                     batch_size=BATCH_SIZE):
+                     target_sr=16_000,
+                     kernel_size=8,
+                     stride=4,
+                     batch_size=4):
     
     """
     Preprocess a batch of audio and transcript data to produce pooled speech embeddings, attention masks, and transcript embeddings.
@@ -280,10 +275,10 @@ def get_device():
 
 def run(
     dataset_url: str,
-    target_sr: int = TARGET_SR,
+    target_sr: int = 16_000,
     kernel_size: int = 8,
     stride: int = 4,
-    batch_size: int = BATCH_SIZE,
+    batch_size: int = 4,
     cache_dir: str = "./cache"
 ):
     """Run the full preprocessing pipeline.
@@ -385,10 +380,10 @@ if __name__ == '__main__':
         description="Precompute pooled speech embeddings (fp16 embeddings, int16 masks) from HuggingFace datasets containing 'sentence' and 'audio' columns. The audio column must be cast to Audio type."
     )
     parser.add_argument("--dataset-url", required=True, help="HuggingFace dataset URL")
-    parser.add_argument("--target-sr", default=TARGET_SR, type=int, help="Target sampling rate for audio resampling (default: 16000)")
-    parser.add_argument("--kernel-size", default=KERNEL_SIZE, type=int, help="Temporal pooling window size applied to pooled speech embeddings (default: 8)")
-    parser.add_argument("--stride", default=STRIDE, type=int, help="Temporal pooling stride applied to pooled speech embeddings (default: 4)")
-    parser.add_argument("--batch-size", default=BATCH_SIZE, type=int, help="Batch size for dataset .map() and encoder inference (default: 256)")
+    parser.add_argument("--target-sr", default=16_000, type=int, help="Target sampling rate for audio resampling (default: 16000)")
+    parser.add_argument("--kernel-size", default=8, type=int, help="Temporal pooling window size applied to pooled speech embeddings (default: 8)")
+    parser.add_argument("--stride", default=4, type=int, help="Temporal pooling stride applied to pooled speech embeddings (default: 4)")
+    parser.add_argument("--batch-size", default=4, type=int, help="Batch size for dataset .map() and encoder inference (default: 256)")
     parser.add_argument("--cache-dir", default="./cache", help="Directory to store cached files (default: ./cache)")
 
     args = parser.parse_args()
