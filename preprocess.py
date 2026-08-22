@@ -337,11 +337,7 @@ def run(
 
     # Remove features specification to let datasets handle types automatically
     # This prevents the KeyError: 'path' issue by not forcing specific feature types
-
-    cache_file_names = {
-        split: f"{cache_dir}/{dataset_url.replace('/', '--')}_{split}_{TE_MODEL_ID.replace('/', '--')}_{SE_MODEL_ID.replace('/', '--')}_sr{target_sr}_ksz{kernel_size}_strd{stride}.arrow"
-        for split in dataset.keys()
-    }
+    ds_dir = f"{cache_dir}/{dataset_url.replace('/', '--')}_{TE_MODEL_ID.replace('/', '--')}_{SE_MODEL_ID.replace('/', '--')}_sr{target_sr}_ksz{kernel_size}_strd{stride}"
 
     tmp = dataset.map(
         preprocess_batch,
@@ -368,9 +364,11 @@ def run(
         for name, split in tmp.items()
     })
 
+    clean.save_to_disk(ds_dir)
+
     # Cache the dataset using Hugging Face's built-in caching instead of save_to_disk
     # The dataset will be cached automatically by Hugging Face
-    print("Dataset preprocessed and cached automatically by Hugging Face.")
+    print(f"Preprocessed dataset saved in {ds_dir}.")
     
     return clean
 
