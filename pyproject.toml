@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "greek-speech-aligner"
+version = "0.2.0"
+description = "Parameter-efficient cross-modal alignment for ASR-free Greek spoken-content retrieval"
+requires-python = ">=3.10"
+authors = [{ name = "Alexandros Tsingilis" }]
+dependencies = [
+    "torch",
+    "lightning",
+    "transformers",
+    "sentence-transformers",
+    "datasets",
+    "librosa",
+    "numpy",
+    "pandas",
+    "matplotlib",
+    "tqdm",
+    "tensorboard",
+]
+
+[project.optional-dependencies]
+dotenv = ["python-dotenv"]
+
+[project.scripts]
+gsa-preprocess = "greek_speech_aligner.cli.preprocess:main"
+gsa-train = "greek_speech_aligner.cli.train:main"
+gsa-evaluate = "greek_speech_aligner.cli.evaluate:main"
+
+[tool.setuptools.packages.find]
+include = ["greek_speech_aligner*"]

@@ -1,87 +1,130 @@
 # Multimodal Greek Speech Aligner
 
-Code for training and evaluating a contrastive aligner that maps Greek speech representations
-to text embeddings (and vice-versa). The project uses precomputed Whisper encoder hidden
-states for speech and E5 embeddings for text.
+Code for training and evaluating a lightweight contrastive aligner for ASR-free Greek
+spoken-content retrieval. A frozen **Whisper-tiny** encoder provides speech representations,
+a frozen **multilingual-e5-small** encoder provides the text space, and a small trainable
+aligner (MLP, temporal CNN or BiLSTM) maps the speech sequence into that space. Only the
+aligner and a temperature parameter are trained, with a bidirectional InfoNCE objective
+(`L = γ·L_s→t + (1−γ)·L_t→s`, γ = 0.1) using in-batch negatives.
 
-Dataset: this project uses the `ddamianos/hparl` dataset (Greek parliamentary transcripts).
-Both `train.py` and `evaluate.py` operate on the preprocessed `hparl` dataset produced by
-`preprocess.py` (default path shown below: `/mnt/h/hparl-preprocessed`).
+Dataset: `ddamianos/hparl` (Hellenic Parliamentary Speech Corpus).
 
-**Contents & key files**
-- `preprocess.py` — prepare dataset and precompute `pooled_speech_embeddings`, `pooled_attn_masks`, `transcript_embeddings` and save to disk.
-- `train.py` / `train.ipynb` — training script and notebook; uses `models.py` and Lightning to train adapters and saves checkpoints and `args.json`/`config.json` under the checkpoint directory.
-- `evaluate.py` — evaluation script (text→speech retrieval). Computes embeddings, similarity matrix, Recall@K and MRR.
-- `models.py` — adapter implementations (`CnnAdapter`, `MlpAdapter`, `LstmAdapter`) and `AlignmentModel`.
-- `configs/` — example configs (adapter kwargs, etc.).
+## Layout
 
-Getting started
----------------
-1. Create a Python environment and install requirements.
-
-	 pip install -r requirements.txt
-
-2. Prepare the dataset (HParl) and precompute embeddings. Default paths in the notebooks assume `/mnt/h/hparl-preprocessed`.
-
-	 # run preprocessing (example)
-	 python preprocess.py --data-dir /path/to/raw_hparl --out-dir /mnt/h/hparl-preprocessed
-
-Training
---------
-Train an adapter (example):
-
-```bash
-python train.py \
-	--data-dir /mnt/h/hparl-preprocessed \
-	--checkpoint-name model_0.ckpt \
-	--config-file configs/cnn-aligner.json \
-	--epochs 40 \
-	--batch-size 128
+```
+greek_speech_aligner/
+├── models/
+│   ├── adapters.py      # MlpAdapter, CnnAdapter, LstmAdapter, E5MLPAdapter, get_adapter_class
+│   ├── alignment.py     # AlignmentModel (aligner + mean pooling + learnable τ + loss)
+│   └── pooling.py       # mask-aware mean pooling
+├── data/
+│   ├── preprocessing.py # Whisper / E5 embedding, temporal pooling, preprocess_dataset()
+│   └── dataset.py       # SpeechTextDataset, collate_fn, SpeechTextDataModule
+├── losses.py            # bidirectional_contrastive_loss, ContrastiveLoss
+├── config.py            # config.json loading, build_adapter / build_model
+├── checkpoint.py        # load_model_from_checkpoint, load_aligner
+├── training.py          # AlignmentLitModule, run_training
+├── evaluation.py        # similarity matrix, Recall@K, MRR, run_evaluation
+├── pipelines.py         # AlignmentPipeline: search a long recording by text query
+├── utils.py             # seeding, device selection, JSON helpers
+└── cli/                 # preprocess / train / evaluate entry points
+configs/                 # example aligner configs (cnn, mlp, lstm)
 ```
 
-- Checkpoints and a `config.json` are saved under the checkpoint directory (e.g. `/mnt/h/outputs/checkpoints/cnn_aligner_0/config.json`).
-- `train.py` also writes an `args.json` containing the full training arguments and `config` used.
+## Getting started
 
-Config format
--------------
-Each checkpoint directory contains a `config.json` describing the adapter to instantiate. Current format:
+```bash
+pip install -r requirements.txt
+pip install -e .          # optional: installs the package and the gsa-* commands
+```
 
-```json
+All commands below are run from the repository root (or use the `gsa-preprocess`,
+`gsa-train`, `gsa-evaluate` scripts after `pip install -e .`).
+
+### 1. Preprocess
+
+Computes `pooled_speech_embeddings`, `pooled_attn_masks` and `transcript_embeddings` for every
+split and saves the dataset with `save_to_disk`. The paper's principal setting uses temporal
+pooling with kernel 32 / stride 16.
+
+```bash
+python -m greek_speech_aligner.cli.preprocess \
+    --dataset-url ddamianos/hparl \
+    --kernel-size 32 --stride 16 \
+    --out-dir /mnt/h/hparl-preprocessed
+```
+
+### 2. Train
+
+```bash
+python -m greek_speech_aligner.cli.train \
+    --data-dir /mnt/h/hparl-preprocessed \
+    --config-file configs/cnn-aligner.json \
+    --checkpoint-dir /mnt/h/outputs/checkpoints/cnn_aligner_0 \
+    --output-checkpoint-name model.ckpt
+```
+
+Defaults follow the paper: AdamW, lr 5e-4, weight decay 5e-5, batch size 128, 40 epochs,
+validation every epoch, 20 % of the train split held out for validation. The checkpoint
+directory receives the checkpoint, `config.json` (aligner + `init_tau` / `gamma`),
+`args.json` (all training arguments) and TensorBoard logs.
+
+### 3. Evaluate (text → speech retrieval)
+
+```bash
+python -m greek_speech_aligner.cli.evaluate \
+    --ckpt-dir /mnt/h/outputs/checkpoints/cnn_aligner_0 \
+    --ckpt-name model.ckpt \
+    --data-dir /mnt/h/hparl-preprocessed \
+    --k 1 5 15 20
+```
+
+Each test transcript is a query and its paired recording is the only relevant passage.
+Recall@K and MRR are printed and saved (CSV, JSON, plot) under
+`<ckpt-dir>/evaluation_results_<ckpt-name>/`.
+
+## Config format
+
+```jsonc
 {
-	"adapter-type": "cnn",    // one of: "cnn", "mlp", "lstm"
-	"kwargs": { ... }         // adapter constructor kwargs (speech_dim, text_dim, hidden_dim, ...)
+  "adapter-type": "cnn",   // one of: cnn, mlp, lstm, e5mlp
+  "kwargs": { ... },       // adapter constructor kwargs (speech_dim, text_dim, hidden_dim, ...)
+  "init_tau": 0.07,        // optional
+  "gamma": 0.1             // optional, weight of the speech→text loss term
 }
 ```
 
-Evaluation
-----------
-Run retrieval evaluation using a checkpoint directory and checkpoint filename:
+## Using a trained aligner from Python
 
-```bash
-python evaluate.py \
-	--ckpt-dir /mnt/h/outputs/checkpoints/cnn_aligner_0/ \
-	--ckpt-name model_0.ckpt \
-	--data-dir /mnt/h/hparl-preprocessed/ \
-	--k 1 3 5 10 15 20
+```python
+from transformers import AutoFeatureExtractor, AutoModel
+from sentence_transformers import SentenceTransformer
+from greek_speech_aligner.checkpoint import load_aligner
+from greek_speech_aligner.pipelines import AlignmentPipeline
+
+aligner = load_aligner("/mnt/h/outputs/checkpoints/cnn_aligner_0", "model.ckpt")
+pipe = AlignmentPipeline(
+    AutoFeatureExtractor.from_pretrained("openai/whisper-tiny"),
+    AutoModel.from_pretrained("openai/whisper-tiny"),
+    aligner,
+    SentenceTransformer("intfloat/multilingual-e5-small"),
+    kernel_size=32, stride=16,      # must match preprocessing used for training
+)
+pipe.load_file("session.wav")
+for idx, _audio in pipe.search("προϋπολογισμός", top_k=5):
+    print(idx, pipe.segment_time(idx))
 ```
 
-What evaluation does
-- Loads `config.json` from `--ckpt-dir` and instantiates the adapter + `AlignmentModel`.
-- Loads the checkpoint `--ckpt-name` from `--ckpt-dir` and attempts to load compatible parameters.
-- Computes speech and text embeddings for the test split, builds a similarity matrix S (queries = rows = ground-truth text embeddings, passages = columns = speech embeddings), then computes Recall@K and MRR.
+## Notes & troubleshooting
 
-Adapters
---------
-- `CnnAdapter`: multi-kernel temporal convolutions + pooling.
-- `MlpAdapter`: per-timestep MLP.
-- `LstmAdapter`: LSTM-based sequence adapter (bidirectional option).
+- Warnings about missing/unexpected keys when loading a checkpoint usually mean the
+  `config.json` does not match the trained architecture. The loader then falls back to
+  loading only shape-compatible parameters, and results are not meaningful.
+- `config.json` files written before v0.2.0 store the CNN stride as `pooling_stride`; it is
+  still accepted.
+- Datasets preprocessed before v0.2.0 have incorrect speech masks (see `CHANGELOG.md`) and
+  should be regenerated.
+- The similarity matrix is `N × M` on the chosen device; it is built in query batches but the
+  full matrix is kept in memory.
 
-Notes & troubleshooting
------------------------
-- If you see warnings about missing/unexpected keys when loading a checkpoint, it usually means the adapter architecture in `config.json` does not match the adapter that was saved in the checkpoint. Ensure `adapter-type` and `kwargs` match the training configuration.
-- The evaluation script will try to load only compatible parameters when shapes differ, but results will be invalid if the adapter architectures differ significantly.
-- Large evaluation runs may require GPU and sufficient memory for the similarity matrix; `evaluate.py` computes the matrix in query batches to reduce peak memory but still requires O(N*M) memory for the final matrix on the chosen device.
-
-Contact
--------
-See the repository owner for questions or feature requests.
+See [CHANGELOG.md](CHANGELOG.md) for the list of changes.

@@ -1,0 +1,13 @@
+{
+  "adapter-type": "lstm",
+  "kwargs": {
+    "speech_dim": 384,
+    "text_dim": 384,
+    "hidden_dim": 256,
+    "num_layers": 3,
+    "bidirectional": true,
+    "dropout": 0.1
+  },
+  "init_tau": 0.07,
+  "gamma": 0.1
+}

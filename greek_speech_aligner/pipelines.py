@@ -1,26 +1,30 @@
 #
-#       indexing_pipelines.py
+#       pipelines.py
 #
-# Indexing pipelines for the multimodal Greek speech alignment project. 
-# Contains functions to process and index the speech and text data, including feature extraction and storage.
+# Inference pipelines: index a long recording as overlapping segments and
+# retrieve the segments that best match a text query (ASR-free).
 #
 # Author: Alexandros Tsingilis
 # Date: 17 Feb 2026
-#%%
-import torch
-import os
-import json
-import numpy as np
+#
 import librosa
-import evaluate, preprocess, models
+import torch
 from tqdm import tqdm
-from itertools import batched
-import pdb
 
+from greek_speech_aligner.data import preprocessing
+from greek_speech_aligner.evaluation import compute_similarity_matrix
+from greek_speech_aligner.models import AlignmentModel
+
+
+def _batched(seq, n):
+    """``itertools.batched`` replacement that also works on Python < 3.12."""
+    for i in range(0, len(seq), n):
+        yield seq[i:i + n]
 
 
 #
-# No-ASR pipeline for segmenting audio, transcribing, and retrieving relevant segments by transcript embedding.
+# ASR-free pipeline: segment audio, embed segments with the aligner, and
+# retrieve relevant segments by text-query embedding.
 #
 class AlignmentPipeline:
     """
@@ -31,7 +35,7 @@ class AlignmentPipeline:
     def __init__(self,
                  whisper_processor,
                  whisper_model,
-                 aligner: models.AlignmentModel,
+                 aligner: AlignmentModel,
                  e5_model,
                  seg_length=10.0, # Seconds
                  overlap=5, # Seconds
@@ -42,22 +46,24 @@ class AlignmentPipeline:
                  device='cpu',
                  batch_size=8):
         """
-        Initialize the IndexingPipeline.
         Args:
-            file_path (str): Path to the audio file to process.
-            seg_length (float): Length of each audio segment in seconds.
-            overlap (float): Overlap between segments in seconds.
+            whisper_processor: Whisper feature extractor.
+            whisper_model: Whisper model (only the encoder is used).
+            aligner (AlignmentModel): Trained aligner.
+            e5_model (SentenceTransformer): multilingual-e5-small text encoder.
+            seg_length (float): Length of each audio segment in seconds (<= 30).
+            overlap (float): Overlap between consecutive segments in seconds.
             sample_rate (int): Audio sample rate for loading.
-            config_path (str): Path to the model config JSON file.
-            ckpt_path (str): Path to the model checkpoint file.
-            device (str): Device to use for model inference (e.g., 'cpu' or 'cuda').
+            kernel_size, stride (int): Temporal pooling used at preprocessing
+                time; must match the setting the aligner was trained with.
+            device (str): Device for inference (e.g. 'cpu' or 'cuda').
+            batch_size (int): Batch size for encoding segments.
         """
-        self.seg_length = seg_length
-        self.overlap = overlap
+        if overlap >= seg_length:
+            raise ValueError(f"overlap ({overlap}s) must be smaller than seg_length ({seg_length}s)")
         self.sample_rate = sample_rate
-        self.device = device
         self.processor = whisper_processor
-        self.whisper = whisper_model.to(device)
+        self.whisper = whisper_model.eval().to(device)
         self.aligner = aligner.eval().to(device)
         self.e5 = e5_model.to(device)
         # hyper parameters
@@ -75,12 +81,10 @@ class AlignmentPipeline:
 
     def _segment_audio(self, waveform):
         """
-        Segment the audio waveform into overlapping segments.
+        Segment the audio waveform into overlapping segments of
+        ``self.seg_length`` seconds with ``self.overlap`` seconds of overlap.
         Args:
-            wf (np.ndarray): Audio waveform array.
-            sr (int): Sample rate of the audio.
-            seg_length (float, optional): Segment length in seconds. Defaults to self.seg_length.
-            overlap (float, optional): Overlap in seconds. Defaults to self.overlap.
+            waveform (np.ndarray): Audio waveform array at ``self.sample_rate``.
         Returns:
             list: List of audio segments as numpy arrays.
         """
@@ -112,26 +116,25 @@ class AlignmentPipeline:
         Preprocess audio segments for embedding.
         Args:
             segments (list of np.ndarray): List of audio segments to preprocess.
-            query (str): Text query to embed.
             batch_size (int): Batch size for processing segments. Defaults to 8.
         Returns:
-            tuple: (speech_hidden, attn_masks, transcript_embs) where each element is a torch.Tensor.
+            tuple: (speech_hidden, attn_masks) as torch.Tensors.
         """
         print("Preprocessing segments...", end='')
         speech_hidden = []  # List[Tensor], each of shape [batch, T, D]
         attn_masks = []     # List[Tensor], each of shape [batch, T]
-        batches = batched(segments, batch_size)
+        batches = _batched(segments, batch_size)
         n_batches = (len(segments) + batch_size - 1) // batch_size
         # Process each batch of segments
         for batch in tqdm(batches, total=n_batches):
             # Preprocess the batch of audio segments and extract features using the Whisper model
-            s, m = preprocess.embed_speech(self.processor,
+            s, m = preprocessing.embed_speech(self.processor,
                                         self.whisper,
-                                        speech=batch,
+                                        speech=list(batch),
                                         sr=self.sample_rate,
                                         device=self.device)
             # Downsample the features to match the aligner's expected input size
-            s, m = preprocess.masked_mean_pool_time(s, m,
+            s, m = preprocessing.masked_mean_pool_time(s, m,
                                                     kernel_size=self.kernel_size,
                                                     stride=self.stride,
                                                     eps=self.eps)
@@ -143,7 +146,7 @@ class AlignmentPipeline:
         attn_masks = torch.cat(attn_masks, dim=0)        # Tensor, shape [num_segments, T]
         print("Done.")
         
-        return speech_hidden, attn_masks, 
+        return speech_hidden, attn_masks
 
     @torch.inference_mode()
     def _align_embeddings(self, speech_hidden, attn_masks, batch_size=8):
@@ -158,14 +161,12 @@ class AlignmentPipeline:
         """
         print("Aligning embeddings...", end='')
         aligned_embeddings = []
-        n_batches = (speech_hidden.shape[0] + batch_size - 1) // batch_size
-        batches = list(batched(range(speech_hidden.shape[0]), batch_size))
+        n = speech_hidden.shape[0]
         # Process each batch of speech hidden states and attention masks through the aligner model
-        for batch in tqdm(batches, total=n_batches):
-            start, end = batch[0], batch[-1] + 1
-            s = speech_hidden[start:end, :, :].to(self.device)  # Tensor, shape [batch_size, T, D]
-            m = attn_masks[start:end, :].to(self.device)       # Tensor, shape [batch_size, T]
-            #*db.set_trace()
+        for start in tqdm(range(0, n, batch_size), total=(n + batch_size - 1) // batch_size):
+            end = start + batch_size
+            s = speech_hidden[start:end].to(self.device)  # Tensor, shape [batch_size, T, D]
+            m = attn_masks[start:end].to(self.device)     # Tensor, shape [batch_size, T]
             aligned_emb = self.aligner.encode(s, m)             # Tensor, shape [batch_size, D]
             aligned_embeddings.append(aligned_emb.cpu())
         # Concatenate the list of aligned embeddings into a single tensor
@@ -175,12 +176,12 @@ class AlignmentPipeline:
 
     def load_file(self, file_path, batch_size=None):
         """
-        Load an audio file and return the waveform and sample rate.
+        Load an audio file, segment it and index the segment embeddings.
+        Results are stored in ``self.waveform``, ``self.segments`` and
+        ``self.speech_embs``.
         Args:
             file_path (str): Path to the audio file to load.
             batch_size (int): Batch size for processing segments.
-        Returns:
-            tuple: (waveform, aligned_embedding) where waveform is a numpy array and aligned_embedding is a torch.Tensor.
         """
         if batch_size is None:
             batch_size = self.batch_size
@@ -190,7 +191,9 @@ class AlignmentPipeline:
         # split the audio into segments
         segments = self._segment_audio(wf)
         # preprocess the segments to extract features and attention masks
-        speech_hidden, attn_masks, = self._preprocess(segments, batch_size=batch_size)
+        if len(segments) == 0:
+            raise ValueError(f"Audio file {file_path!r} is empty.")
+        speech_hidden, attn_masks = self._preprocess(segments, batch_size=batch_size)
         # Produce final speech embeddings using the aligner model
         aligned_embedding = self._align_embeddings(speech_hidden, attn_masks, batch_size=batch_size)
         # Store the aligned embeddings
@@ -204,29 +207,28 @@ class AlignmentPipeline:
         Returns:
             torch.Tensor: Embedded query tensor of shape [1, D].
         """
-        query_emb = preprocess.embed_transcripts(self.e5, 
-                                                 {'sentence': [query]})
+        query_emb = preprocessing.embed_transcripts(self.e5, {'sentence': [query]})
         return query_emb
 
     def _retrieve(self, speech_embs, query_emb, top_k=5):
         """
         Retrieve the top-k most relevant audio segments for a given query embedding.
         Args:
-            speech_emb (torch.Tensor): Encoder hidden states of shape ``[B, T, D]`` (CPU, float32).
-            attn_mask (torch.Tensor): Attention mask of shape ``[B, T]`` (CPU, int16).
-            query_emb (torch.Tensor): Embedded query tensor.
+            speech_embs (torch.Tensor): Aligned segment embeddings ``[N, D]``.
+            query_emb (torch.Tensor): Embedded queries ``[Q, D]``.
             top_k (int): Number of top segments to retrieve.
 
         Returns:
             list: List of indices of the top-k most relevant segments.
         """
         # Compute cosine similarity between the query embedding and the aligned speech embeddings
-        similarity = evaluate.compute_similarity_matrix(query_emb, 
+        similarity = compute_similarity_matrix(query_emb,
                                                         speech_embs,
                                                         device=self.device,
                                                         batch_size=self.batch_size)  # Tensor, shape [num_queries, num_segments]
 
         # Retrieve the indices of the top-k most relevant segments based on similarity scores
+        top_k = min(top_k, similarity.shape[1])
         top_k_indices = torch.topk(similarity, k=top_k).indices.cpu().numpy().tolist()  # List[List[int]], shape [num_queries, top_k]
         return top_k_indices
 
@@ -239,8 +241,8 @@ class AlignmentPipeline:
             top_k (int): Number of top segments to retrieve.
 
         Returns:
-            list: List of indices of the top-k most relevant segments.
-            list: List of time ranges (start_time, end_time) in seconds corresponding to the top-k segments.
+            list: ``[segment_index, segment_waveform]`` pairs for the top-k
+            segments, best first. Use :meth:`segment_time` for time ranges.
         """
         if self.speech_embs is None:
             raise ValueError("No speech embeddings found. Please load an audio file first using load_file().")
@@ -251,14 +253,16 @@ class AlignmentPipeline:
         top_k_indices = self._retrieve(self.speech_embs,
                                        query_emb, 
                                        top_k=top_k)[0] #! Chnage later for num(queries) > 1
-        #*pdb.set_trace()
         audio_elements = [
             [idx, self.segments[idx]]
             for idx in top_k_indices
         ]
         return audio_elements
 
-
-#
-# ASR-based pipeline for segmenting audio, transcribing, and retrieving relevant segments by transcript embedding.
-#
+    def segment_time(self, idx):
+        """Return ``(start_s, end_s)`` of segment ``idx`` in the loaded file."""
+        sr = self.sample_rate
+        step = int(self.seg_length * sr) - int(self.overlap * sr)  # as in _segment_audio
+        start = idx * step / sr
+        end = start + len(self.segments[idx]) / self.sample_rate
+        return start, end

@@ -1,26 +1,24 @@
-#   precompute.py
+#   preprocessing.py
 #
-# Precompute speech and transcript embeddings from the original hparl dataset
-# Embeddings stored as float16, masks stored as int16
+# Precompute (temporally pooled) Whisper encoder states and E5 transcript
+# embeddings from a HuggingFace speech dataset (e.g. ddamianos/hparl) and
+# save the result with ``DatasetDict.save_to_disk``.
 #
 # Author: Alexandros Tsingilis
 # Date: 28 Nov 2025
 #
-import os, re, string, unicodedata
-import argparse
-import torch
+import re
+import string
+import unicodedata
+
 import librosa
 import numpy as np
+import torch
 import torch.nn.functional as F
-from datasets import DatasetDict, Features, Array2D, Sequence, Value, load_dataset
-from transformers import AutoModel, AutoFeatureExtractor
-from sentence_transformers import SentenceTransformer
-from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv()
+from greek_speech_aligner.utils import get_device
 
-# Default arguments
+# Default encoders (both frozen)
 SE_MODEL_ID = 'openai/whisper-tiny'
 TE_MODEL_ID = 'intfloat/multilingual-e5-small'
 
@@ -75,7 +73,9 @@ def embed_speech(preprocessor, model, speech, sr, device):
     speech_emb : torch.Tensor
         Encoder hidden states of shape ``[B, T, D]`` (CPU, float32).
     attn_mask : torch.Tensor
-        Attention mask of shape ``[B, T]`` (CPU, int16).
+        Attention mask of shape ``[B, T]`` (CPU, int16), at the resolution of
+        the encoder output (i.e. downsampled from the log-Mel frame rate by
+        the encoder's convolutional stride, which is 2 for Whisper).
     """
     # Ensure we're passing the correct sampling rate to the preprocessor
     inputs = preprocessor(
@@ -98,7 +98,12 @@ def embed_speech(preprocessor, model, speech, sr, device):
 
     speech_emb = enc_out.last_hidden_state.cpu()
     T_max = speech_emb.size(1)
-    attn_mask = attn_mask[:, :T_max].to(torch.int16).cpu()
+    # The feature-extractor mask is defined on log-Mel frames (3000 per 30 s),
+    # while the encoder output has T_max frames (1500): subsample the mask by
+    # the encoder stride instead of truncating it, otherwise ~half of the
+    # padding frames would be marked as valid.
+    enc_stride = max(1, attn_mask.size(1) // T_max)
+    attn_mask = attn_mask[:, ::enc_stride][:, :T_max].to(torch.int16).cpu()
 
     return speech_emb, attn_mask
 
@@ -165,7 +170,7 @@ def embed_transcripts(encoder, batch, batch_size=4):
     """Encode transcript sentences into normalised E5 embeddings.
 
     Each sentence is cleaned via :func:`clean_text`, prepended with the
-    ``'query: '`` prefix required by E5, and encoded with the
+    ``'query: '`` prefix expected by E5, and encoded with the
     SentenceTransformer model.
 
     Parameters
@@ -264,51 +269,55 @@ def preprocess_batch(batch,
         'transcript_embeddings': transcript_emb.tolist(),
     }
 
-def get_device():
-    """Detect and return the best available device (cuda, mps, or cpu)."""
-    if torch.cuda.is_available():
-        return "cuda"
-    elif torch.backends.mps.is_available() and torch.backends.mps.is_built():
-        return "mps"
-    else:
-        return "cpu"
 
-def run(
+def default_output_dir(dataset_url, cache_dir, target_sr, kernel_size, stride):
+    """Directory name that encodes the dataset, encoders and pooling setup."""
+    return (
+        f"{cache_dir}/{dataset_url.replace('/', '--')}"
+        f"_{TE_MODEL_ID.replace('/', '--')}_{SE_MODEL_ID.replace('/', '--')}"
+        f"_sr{target_sr}_ksz{kernel_size}_strd{stride}"
+    )
+
+
+def preprocess_dataset(
     dataset_url: str,
     target_sr: int = 16_000,
     kernel_size: int = 8,
     stride: int = 4,
     batch_size: int = 4,
-    cache_dir: str = "./cache"
+    cache_dir: str = "./cache",
+    out_dir: str = None,
 ):
     """Run the full preprocessing pipeline.
 
-    Loads the raw dataset from dataset_url, computes pooled Whisper
-    encoder embeddings for speech and normalised E5 embeddings for
-    transcripts, then saves the result as an Arrow dataset.
+    Loads the raw dataset, computes pooled Whisper encoder embeddings for
+    speech and normalised E5 embeddings for transcripts, and saves the result
+    with ``save_to_disk``.
 
     Parameters
     ----------
     dataset_url : str
-        HuggingFace dataset URL to load.
+        HuggingFace dataset id (must have ``audio`` and ``sentence`` columns).
     target_sr : int
         Target sampling rate for audio resampling (default: 16000).
-    kernel_size : int
-        Temporal pooling window size (default: 8).
-    stride : int
-        Temporal pooling stride (default: 4).
+    kernel_size, stride : int
+        Temporal average-pooling window and stride (paper: (8, 4) and (32, 16)).
     batch_size : int
-        Batch size for dataset ``.map()`` and encoder inference.
+        Batch size for ``Dataset.map`` and encoder inference.
     cache_dir : str
-        Directory to store cached files (default: "./cache").
+        Parent directory for the output when ``out_dir`` is not given.
+    out_dir : str, optional
+        Explicit output directory.
 
     Returns
     -------
-    DatasetDict
-        The precomputed dataset with columns ``pooled_speech_embeddings``,
-        ``pooled_attn_masks``, and ``transcript_embeddings``.
+    (DatasetDict, str)
+        The precomputed dataset and the directory it was saved to.
     """
-    # Encoders
+    from datasets import DatasetDict, load_dataset
+    from sentence_transformers import SentenceTransformer
+    from transformers import AutoFeatureExtractor, AutoModel
+
     device = get_device()
     print(f"Using {device}")
 
@@ -316,34 +325,13 @@ def run(
     speech_model = AutoModel.from_pretrained(SE_MODEL_ID).to(device).eval()
     te_model = SentenceTransformer(TE_MODEL_ID, device=device)
 
-    # Find out resulting shapes
     dataset = load_dataset(dataset_url)
-    test_batch = dataset['test'][0:1]
-    test_speech = resample(test_batch, target_sr)
-    test_sp_emb, test_attn_mask = embed_speech(speech_preprocessor,
-                                               speech_model,
-                                               test_speech,
-                                               target_sr,
-                                               device)
-    pooled_test_sp_emb, pooled_test_mask = masked_mean_pool_time(test_sp_emb,
-                                                                 test_attn_mask,
-                                                                 kernel_size=kernel_size,
-                                                                 stride=stride)
-    test_txt_emb = embed_transcripts(te_model,
-                                     test_batch,
-                                     batch_size=1)
-    _, time_dim, speech_dim = pooled_test_sp_emb.size()
-    _, text_dim = test_txt_emb.size()
+    ds_dir = out_dir or default_output_dir(dataset_url, cache_dir, target_sr, kernel_size, stride)
 
-    # Remove features specification to let datasets handle types automatically
-    # This prevents the KeyError: 'path' issue by not forcing specific feature types
-    ds_dir = f"{cache_dir}/{dataset_url.replace('/', '--')}_{TE_MODEL_ID.replace('/', '--')}_{SE_MODEL_ID.replace('/', '--')}_sr{target_sr}_ksz{kernel_size}_strd{stride}"
-
-    tmp = dataset.map(
+    processed = dataset.map(
         preprocess_batch,
         batched=True,
         batch_size=batch_size,
-        num_proc=None,
         fn_kwargs={
             "speech_preprocessor": speech_preprocessor,
             "speech_model": speech_model,
@@ -352,37 +340,11 @@ def run(
             "target_sr": target_sr,
             "kernel_size": kernel_size,
             "stride": stride,
-            "batch_size": batch_size
+            "batch_size": batch_size,
         },
-        desc="Precomputing pooled speech + text embeddings"
+        desc="Precomputing pooled speech + text embeddings",
     )
-
-    clean = DatasetDict({
-        name: split
-        for name, split in tmp.items()
-    })
-
-    clean.save_to_disk(ds_dir)
-
-    # Cache the dataset using Hugging Face's built-in caching instead of save_to_disk
-    # The dataset will be cached automatically by Hugging Face
+    processed = DatasetDict(dict(processed.items()))
+    processed.save_to_disk(ds_dir)
     print(f"Preprocessed dataset saved in {ds_dir}.")
-    
-    return clean
-
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(
-        description="Precompute pooled speech embeddings (fp16 embeddings, int16 masks) from HuggingFace datasets containing 'sentence' and 'audio' columns. The audio column must be cast to Audio type."
-    )
-    parser.add_argument("--dataset-url", required=True, help="HuggingFace dataset URL")
-    parser.add_argument("--target-sr", default=16_000, type=int, help="Target sampling rate for audio resampling (default: 16000)")
-    parser.add_argument("--kernel-size", default=8, type=int, help="Temporal pooling window size applied to pooled speech embeddings (default: 8)")
-    parser.add_argument("--stride", default=4, type=int, help="Temporal pooling stride applied to pooled speech embeddings (default: 4)")
-    parser.add_argument("--batch-size", default=4, type=int, help="Batch size for dataset .map() and encoder inference (default: 256)")
-    parser.add_argument("--cache-dir", default="./cache", help="Directory to store cached files (default: ./cache)")
-
-    args = parser.parse_args()
-    
-    # Load the dataset using the HuggingFace datasets library
-    run(**vars(args))
+    return processed, ds_dir
